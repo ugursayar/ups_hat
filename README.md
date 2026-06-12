@@ -1,5 +1,12 @@
 # Waveshare UPS HAT — Battery Monitor & Safe Shutdown
-*Adapted from the UPS_HAT_E software for the INA219-based UPS HAT*
+
+Enhancements for the [Waveshare UPS HAT](https://www.waveshare.com/product/ups-hat.htm) for Raspberry Pi, based on the [official demo code](https://www.waveshare.com/wiki/UPS_HAT).
+
+## Features
+
+- **Battery monitoring tray icon** — live voltage, percentage, and charging state in the desktop system tray
+- **Automatic shutdown on low battery** — configurable voltage thresholds trigger a graceful countdown shutdown
+- **Auto installer** — one-command setup via `install.sh`
 
 ---
 
