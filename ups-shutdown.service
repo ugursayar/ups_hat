@@ -1,0 +1,16 @@
+[Unit]
+Description=Waveshare UPS HAT — Safe Shutdown Monitor (INA219)
+Documentation=https://www.waveshare.com/wiki/UPS_HAT
+After=network.target
+
+[Service]
+Type=simple
+# ── Change the path below if you installed to a different directory ──
+ExecStart=/usr/bin/python3 /home/pi/ups_hat/ups_shutdown.py
+Restart=on-failure
+RestartSec=10s
+# Run as root so it can call 'poweroff'
+User=root
+
+[Install]
+WantedBy=multi-user.target

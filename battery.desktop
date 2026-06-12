@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=UPS Battery Monitor
+Comment=Waveshare UPS HAT battery indicator
+Exec=PLACEHOLDER_PATH/battery.sh
+Icon=battery
+Terminal=false
+Type=Application
+Categories=System;
+StartupNotify=false
