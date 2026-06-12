@@ -1,5 +1,7 @@
 # Waveshare UPS HAT — Battery Monitor & Safe Shutdown
 
+![Waveshare UPS HAT](ups-hat.jpg)
+
 Enhancements for the [Waveshare UPS HAT](https://www.waveshare.com/product/ups-hat.htm) for Raspberry Pi, based on the [official demo code](https://www.waveshare.com/wiki/UPS_HAT).
 
 ## Features
