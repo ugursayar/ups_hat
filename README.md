@@ -180,3 +180,75 @@ the reading will be most accurate in the middle of the range.
 - Tray app log:      `~/ups_hat/battery.log`
 - Shutdown service:  `~/ups_hat/ups_shutdown.log`  
   and `sudo journalctl -u ups-shutdown -f`
+
+## Battery percentage: load-compensated, not raw voltage (fixed 2026-09-01)
+
+**Symptom:** unplug the mains and the percentage falls; plug it back and it rises.
+No charge moved. The reading was tracking **load**, not charge.
+
+**Cause.** The old formula was a straight line through terminal voltage:
+
+```python
+pct = (v - 6.0) / (8.4 - 6.0) * 100
+```
+
+Two independent errors in one line.
+
+**1. Terminal voltage sags under load.** The pack's internal resistance was measured
+here by stepping CPU load and fitting V against I:
+
+| method | current span | result |
+|---|---|---|
+| load step (4 busy cores) | 210 mA, residual sd 4.6 mV | **511 mΩ** |
+| float noise, 10,782 samples | 396 mA about zero | 602 mΩ |
+
+At 511 mΩ:
+
+| load | sag | old reading fell by |
+|---|---|---|
+| 0.5 A | 301 mV | 12.5 points |
+| 1.0 A | 602 mV | 25.1 points |
+| 2.0 A | 1.20 V | **50.1 points** |
+
+**2. Li-ion is not linear in voltage.** The curve is flat through the middle, so a
+straight line over-reports badly where it matters — at 3.70 V/cell it claimed **58%**
+when the pack holds about **17%**.
+
+**Fix.** Undo the IR drop, then interpolate a real cell curve:
+
+```python
+v_oc = v - PACK_R_OHM * (current_ma / 1000)     # + is charging
+pct  = soc_percent(v_oc)                        # 13-point OCV table, per cell
+```
+
+Verified in production against a 180 mA load step:
+
+```
+before   8.232V  +7.9mA   93.0%      8.128V  -182.7mA  88.7%     4.3 points of nothing
+after    8.220V  -4.9mA   91.1%      8.128V  -177.9mA  90.9%     0.2 points
+```
+
+The log now prints both: `8.128V (oc 8.221V) -177.9mA 1.448W 90.9% [DIS]`.
+
+⚠ `PACK_R_OHM` is the resistance **seen at the INA219** — pack, wiring and whatever the
+charger presents. With mains unplugged the topology changes and it may differ. Re-measure
+on battery to refine it.
+
+### The charging flag was noise
+
+`chg = current > 50 mA` against a float current of **+4.3 mA mean over −276…+120 mA**
+read "charging" in 2% of samples while on mains, flipping CHG/DIS at random. Replaced with
+hysteresis on a 5-sample average: on above 80 mA, off below 20 mA.
+
+## Shutdown thresholds
+
+| condition | action |
+|---|---|
+| `v < 6.2 V` and not charging | **immediate `poweroff`**, no countdown |
+| `v < 6.4 V` and not charging, 5 consecutive reads (10 s) | warn, then **60 s countdown**; cancelled if voltage recovers or charging starts |
+
+**These stayed on raw terminal voltage, deliberately.** Compensating them would let the
+pack run further down before shutdown — more runtime, less margin. Under a 1 A load the
+pack trips at 6.4 V terminal ≈ 7.0 V resting, so it shuts down **earlier** than strictly
+needed. That is the conservative direction, and after a deep discharge destroyed quali's
+eMMC on 2026-08-04 it is the right one. Changing it is a decision, not a cleanup.

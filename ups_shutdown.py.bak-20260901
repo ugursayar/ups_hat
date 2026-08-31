@@ -49,13 +49,7 @@ I2C_ADDR              = 0x42   # INA219 address — verify with: i2cdetect -y 1
 POLL_INTERVAL_S       = 2      # seconds between readings
 LOW_VOLTAGE_V         = 6.4    # warn threshold  (≈ 3.20 V / cell on 2S pack)
 SHUTDOWN_VOLTAGE_V    = 6.2    # hard shutdown   (≈ 3.10 V / cell)
-CHARGING_THRESHOLD_MA = 50     # mA — above this = charging (legacy, see hysteresis below)
-# The raw flag flipped CHG/DIS on noise: float current measures +4.3 mA mean
-# over -276..+120 mA, so it read 'charging' in 2% of samples while on mains.
-# Separate on/off thresholds on a smoothed current instead.
-CHG_ON_MA             = 80     # smoothed current above this -> charging
-CHG_OFF_MA            = 20     # and below this -> not charging
-CHG_SMOOTH_N          = 5      # samples in the moving average
+CHARGING_THRESHOLD_MA = 50     # mA — above this = charging
 CONFIRM_CYCLES        = 5      # consecutive low-voltage readings before warning
 SHUTDOWN_WARN_SECS    = 60     # countdown (seconds) from warning to poweroff
 
@@ -106,46 +100,6 @@ class INA219:
         return raw * self._POWER_LSB
 
 
-# ── Battery state of charge ───────────────────────────────────────────────────
-# The pack's terminal voltage is not its state of charge. Under load it sags by
-# I*R, so the old linear map read ~50 points lower at 2 A than at rest with the
-# same charge in the pack -- unplug the mains and the number fell, plug it back
-# and it rose. Two things fix that: undo the IR drop, then use a real Li-ion
-# curve instead of a straight line.
-#
-# R measured 2026-09-01 by stepping CPU load and fitting V against I:
-#   load step  (210 mA span, residual sd 4.6 mV) -> 511 mOhm
-#   float only (396 mA span, noisy about zero)   -> 602 mOhm
-# The load-step figure is better conditioned. It is the resistance seen AT THE
-# INA219 -- pack, wiring and whatever the charger presents -- so with mains
-# unplugged the topology changes and it may differ.
-PACK_R_OHM = 0.511
-CELLS      = 2
-
-# Open-circuit volts per cell -> percent. Flat through the middle, which is what
-# the linear map got wrong: at 3.70 V/cell it claimed 58%, the truth is ~17%.
-_OCV_SOC = [
-    (4.20, 100.0), (4.10, 90.0), (4.00, 80.0), (3.93, 70.0), (3.87, 60.0),
-    (3.82, 50.0), (3.79, 40.0), (3.77, 30.0), (3.74, 20.0), (3.68, 15.0),
-    (3.45, 10.0), (3.20, 5.0), (3.00, 0.0),
-]
-
-def open_circuit_v(v_terminal, current_a):
-    """Undo the IR drop. current_a is positive when charging, as the INA219 reports."""
-    return v_terminal - PACK_R_OHM * current_a
-
-def soc_percent(v_oc):
-    per_cell = v_oc / CELLS
-    if per_cell >= _OCV_SOC[0][0]:
-        return 100.0
-    if per_cell <= _OCV_SOC[-1][0]:
-        return 0.0
-    for (v_hi, s_hi), (v_lo, s_lo) in zip(_OCV_SOC, _OCV_SOC[1:]):
-        if v_lo <= per_cell <= v_hi:
-            return s_lo + (per_cell - v_lo) / (v_hi - v_lo) * (s_hi - s_lo)
-    return 0.0
-
-
 # ── Main monitoring loop ──────────────────────────────────────────────────────
 def monitor():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
@@ -163,31 +117,18 @@ def monitor():
     warned          = False
     warn_start_time = 0.0
 
-    recent  = []          # rolling current, for the charging hysteresis
-    chg     = False
+    BATT_EMPTY_V = 6.0
+    BATT_FULL_V  = 8.4
 
     while True:
         try:
             v   = ina.get_bus_voltage_v()
             c   = ina.get_current_ma()
             pw  = ina.get_power_w()
-
-            v_oc = open_circuit_v(v, c / 1000.0)
-            pct  = soc_percent(v_oc)
-
-            # Hysteresis on a smoothed current, so a pack floating at a few mA
-            # stops flipping CHG/DIS every other sample.
-            recent.append(c)
-            del recent[:-CHG_SMOOTH_N]
-            c_avg = sum(recent) / len(recent)
-            if chg and c_avg < CHG_OFF_MA:
-                chg = False
-            elif not chg and c_avg > CHG_ON_MA:
-                chg = True
+            pct = max(0.0, min(100.0, (v - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V) * 100))
+            chg = c > CHARGING_THRESHOLD_MA
             state = "CHG" if chg else "DIS"
-
-            logging.info("%.3fV (oc %.3fV)  %+7.1fmA  %.3fW  %5.1f%%  [%s]",
-                         v, v_oc, c, pw, pct, state)
+            logging.info("%.3fV  %+7.1fmA  %.3fW  %5.1f%%  [%s]", v, c, pw, pct, state)
 
         except Exception as exc:
             logging.error("Read error: %s", exc)
