@@ -243,6 +243,23 @@ reported charge barely moves.
 
 The log now prints both: `8.128V (oc 8.221V) -177.9mA 1.448W 90.9% [DIS]`.
 
+### Validated by a current reversal
+
+The strongest check was accidental. Unplugging and later reconnecting the mains reverses
+the current through the pack, and the compensated voltage should not notice:
+
+```
+before mains   6.912 V @  -759.6 mA  ->  V_oc 7.352 V   14.9%
+after  mains   7.892 V @  +898.7 mA  ->  V_oc 7.372 V   15.5%
+```
+
+**Terminal voltage jumped 980 mV across a 1658 mA reversal. Compensated V_oc moved 20 mV.**
+A wrong `R` of δ would show as a jump of δ × 1.658 A, so 20 mV puts δ at **12 mΩ** — the
+579 mΩ figure is good to about 2%.
+
+The old formula across the same instant would have read **38.0% → 78.8%**, jumping 40 points
+at the moment a plug went in.
+
 ⚠ `PACK_R_OHM` is the resistance **seen at the INA219** — pack, wiring and whatever the
 charger presents. With mains unplugged the topology changes and it may differ. Re-measure
 on battery to refine it.
