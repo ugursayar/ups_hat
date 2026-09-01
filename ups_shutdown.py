@@ -114,12 +114,14 @@ class INA219:
 # curve instead of a straight line.
 #
 # R measured 2026-09-01 by stepping CPU load and fitting V against I:
-#   load step  (210 mA span, residual sd 4.6 mV) -> 511 mOhm
-#   float only (396 mA span, noisy about zero)   -> 602 mOhm
-# The load-step figure is better conditioned. It is the resistance seen AT THE
-# INA219 -- pack, wiring and whatever the charger presents -- so with mains
-# unplugged the topology changes and it may differ.
-PACK_R_OHM = 0.511
+#   ON BATTERY, mains unplugged  (561 mA span, residual sd 19.8 mV) -> 579 mOhm
+#   on mains, load step          (210 mA span, residual sd  4.6 mV) -> 511 mOhm
+#   on mains, float noise only   (396 mA span, noisy about zero)    -> 602 mOhm
+# Use the battery figure. Compensation only does anything while discharging, so
+# it should be measured in that topology -- and with the charger out of the loop
+# the span is nearly three times wider. The 68 mOhm gap against the mains figure
+# is the charger's own regulation, which is not in circuit when it matters.
+PACK_R_OHM = 0.579
 CELLS      = 2
 
 # Open-circuit volts per cell -> percent. Flat through the middle, which is what

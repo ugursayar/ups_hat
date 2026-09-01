@@ -199,8 +199,14 @@ here by stepping CPU load and fitting V against I:
 
 | method | current span | result |
 |---|---|---|
-| load step (4 busy cores) | 210 mA, residual sd 4.6 mV | **511 mΩ** |
-| float noise, 10,782 samples | 396 mA about zero | 602 mΩ |
+| **on battery, load step** | **561 mA**, residual sd 19.8 mV | **579 mΩ ← used** |
+| on mains, load step | 210 mA, residual sd 4.6 mV | 511 mΩ |
+| on mains, float noise, 10,782 samples | 396 mA about zero | 602 mΩ |
+
+The battery figure is the one to use: compensation only does anything while
+discharging, so it belongs in that topology, and with the charger out of the loop the
+current span is nearly three times wider. The 68 mΩ gap against the mains figure is the
+charger's own regulation, which is not in circuit when it matters.
 
 At 511 mΩ:
 
@@ -221,12 +227,19 @@ v_oc = v - PACK_R_OHM * (current_ma / 1000)     # + is charging
 pct  = soc_percent(v_oc)                        # 13-point OCV table, per cell
 ```
 
-Verified in production against a 180 mA load step:
+Verified in production twice — on mains against a 180 mA step, then on battery against a
+527 mA step, which is the case that matters:
 
 ```
-before   8.232V  +7.9mA   93.0%      8.128V  -182.7mA  88.7%     4.3 points of nothing
-after    8.220V  -4.9mA   91.1%      8.128V  -177.9mA  90.9%     0.2 points
+on mains,  before   8.232V  +7.9mA  93.0%   8.128V  -182.7mA  88.7%   4.3 points of nothing
+on mains,  after    8.220V  -4.9mA  91.1%   8.128V  -177.9mA  90.9%   0.2 points
+
+on battery, old formula would read       7.712V  71.3%   7.428V  59.5%   11.8 points
+on battery, actual reading               7.712V  87.6%   7.428V  88.7%    1.1 points
 ```
+
+That second block is the real test: 284 mV of terminal sag across the step, and the
+reported charge barely moves.
 
 The log now prints both: `8.128V (oc 8.221V) -177.9mA 1.448W 90.9% [DIS]`.
 
