@@ -404,3 +404,65 @@ with it**; the residual fell from 126 mV to 16 mV.
 
 The spread is real: R depends on current, charge and temperature, so a single constant is an
 approximation. It is a good one — 610 vs 579 is 24 mV at 0.8 A — but it is not exact.
+
+## Coulomb counting (2026-09-01)
+
+Voltage reports a cell's *equilibrium* potential. Right after charging it is nowhere near
+equilibrium — surface charge was worth **~30 points** here — and under load it is masked by
+IR drop. Integrating current measures charge directly instead of inferring it.
+
+```
+soc_ah += I · dt                      every poll, I positive = charging
+```
+
+The integrator drifts (INA219 offset accumulates), so voltage is kept as a **slow anchor**:
+**the counter owns the short term, voltage owns the long term.**
+
+| mechanism | when | what it does |
+|---|---|---|
+| integrate | always | tracks charge in and out |
+| voltage anchor | `\|I\| < 50 mA` **and** ≥20 min since charging | pulls toward the voltage estimate at 2%/sample (~2 min) |
+| full reset | charging, ≥4.15 V/cell, current tapered | sets 100% — the one point where voltage is unambiguous |
+| capacity learning | between two anchored points ≥25 points apart | Ah moved ÷ fraction moved |
+
+State persists to `/var/lib/ups_hat/state.json`, written atomically every 30 s so a power
+cut cannot leave it half-written. The log now shows both opinions:
+
+```
+8.112V (oc 7.931V)  +296.0mA  2.033W  75.6% (v 75.1%)  [CHG] ~settling
+                                       ^counted  ^voltage
+```
+
+### ⚠ Safety is deliberately NOT on the counter
+
+All three shutdown paths still read voltage only — `v` for the raw floor, `v_oc` for the two
+thresholds. **An integrator that has drifted must never be able to talk the monitor out of
+powering off.** Verified after each change:
+
+```
+if v     < RAW_FLOOR_V           # raw terminal, bypasses everything
+if v_oc  < SHUTDOWN_VOLTAGE_V    # hard
+if v_oc  < LOW_VOLTAGE_V         # warn + countdown
+```
+
+### Capacity, and what it says about the pack
+
+Seeded at **0.80 Ah** and learned from use. That seed comes from a measurement, not a
+datasheet: a 38-minute discharge on 2026-09-01 delivered **0.445 Ah** across a voltage-implied
+69.7 points, giving **0.64 Ah** — and that under-states it, because the start was
+surface-charge inflated.
+
+Healthy 18650s in 2S would be 2–3 Ah. **If the learned figure settles near 1 Ah, that is a
+statement about the cells, not a bug in the counter.** Watch the `capacity estimate` lines.
+
+### Tested
+
+Simulated against a pack of known capacity:
+
+- tracks a 10-minute 1 A discharge to **0.1 points**
+- with the capacity guess **44% too small**, drifts 14.9 points during discharge and the
+  anchor pulls it back to **0.0** after 30 minutes at rest
+
+⚠ The simulation derives voltage from true state of charge, so it contains **no surface
+charge** — it cannot demonstrate the thing this change exists for. That needs a real
+charge/discharge cycle to confirm.

@@ -16,6 +16,7 @@ Or run once:
     sudo python3 ups_shutdown.py
 """
 
+import json
 import os
 import sys
 import time
@@ -72,6 +73,28 @@ CHG_SMOOTH_N          = 5      # samples in the moving average
 # settled at ~50% having delivered only 0.12 Ah -- far too little to be capacity.
 # Any reading in this window is optimistic and is marked so.
 SETTLE_SECS           = 1200   # 20 min after charging stops
+
+# ── Coulomb counting ──────────────────────────────────────────────────────────
+# Voltage tells you a cell's equilibrium potential, which is not where it is
+# right after charging (surface charge cost ~30 points here) nor under load.
+# Integrating current measures charge directly. It drifts, so voltage is kept as
+# a slow anchor: the integrator owns the short term, voltage owns the long term.
+#
+# SAFETY: the shutdown thresholds stay on VOLTAGE. An integrator that has drifted
+# must never be able to talk the monitor out of powering off.
+STATE_FILE       = "/var/lib/ups_hat/state.json"
+NOMINAL_CAP_AH   = 0.80    # seed only; learned from use. A discharge on
+                           # 2026-09-01 implied 0.64 Ah, biased low by surface
+                           # charge at the start, against ~2-3 Ah for healthy
+                           # 18650s -- so treat a low learned value as a real
+                           # statement about the pack, not a bug.
+REST_CURRENT_A   = 0.05    # below this the pack is at rest and voltage is usable
+ANCHOR_GAIN      = 0.02    # per sample, so a voltage correction takes ~2 min
+FULL_CELL_V      = 4.15    # at/above this while charging and tapering -> full
+TAPER_CURRENT_A  = 0.08
+CAP_LEARN_MIN_D  = 25.0    # points of anchored SoC change before trusting a
+                           # capacity estimate
+CAP_LEARN_GAIN   = 0.25
 CONFIRM_CYCLES        = 5      # consecutive low-voltage readings before warning
 SHUTDOWN_WARN_SECS    = 60     # countdown (seconds) from warning to poweroff
 
@@ -165,6 +188,23 @@ def open_circuit_v(v_terminal, current_a):
     corr = max(-MAX_COMPENSATION_V, min(MAX_COMPENSATION_V, corr))
     return v_terminal + corr
 
+def _load_state():
+    try:
+        with open(STATE_FILE) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+def _save_state(d):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(d, fh)
+        os.replace(tmp, STATE_FILE)          # atomic, so a power cut cannot
+    except Exception as exc:                 # leave a half-written state file
+        logging.debug("state save failed: %s", exc)
+
 def soc_percent(v_oc):
     per_cell = v_oc / CELLS
     if per_cell >= _OCV_SOC[0][0]:
@@ -198,6 +238,20 @@ def monitor():
     chg     = False
     last_charge_t = time.time()   # assume settling at start; it clears itself
 
+    # ── coulomb counter ──────────────────────────────────────────────────────
+    st          = _load_state()
+    capacity_ah = float(st.get("capacity_ah", NOMINAL_CAP_AH))
+    soc_ah      = st.get("soc_ah")          # None on a first run
+    last_t      = time.time()
+    last_save   = 0.0
+    anchor_ref  = None                      # (voltage SoC %, coulombs since) for learning
+    if soc_ah is None:
+        logging.info("no saved charge state — seeding from voltage on the first reading")
+    else:
+        soc_ah = float(soc_ah)
+        logging.info("resuming: %.3f Ah of %.3f Ah (%.1f%%)",
+                     soc_ah, capacity_ah, 100 * soc_ah / capacity_ah)
+
     while True:
         try:
             v   = ina.get_bus_voltage_v()
@@ -205,7 +259,6 @@ def monitor():
             pw  = ina.get_power_w()
 
             v_oc = open_circuit_v(v, c / 1000.0)
-            pct  = soc_percent(v_oc)
 
             # Hysteresis on a smoothed current, so a pack floating at a few mA
             # stops flipping CHG/DIS every other sample.
@@ -222,10 +275,58 @@ def monitor():
             if chg:
                 last_charge_t = time.time()
             settling = (time.time() - last_charge_t) < SETTLE_SECS
+
+            # ── integrate charge ─────────────────────────────────────────────
+            now = time.time()
+            dt  = now - last_t
+            last_t = now
+            v_pct = soc_percent(v_oc)             # the voltage opinion
+
+            if soc_ah is None:                    # first ever reading
+                soc_ah = v_pct / 100.0 * capacity_ah
+
+            if 0 < dt < 60:                       # ignore a suspended clock
+                soc_ah += (c / 1000.0) * dt / 3600.0
+            soc_ah = max(0.0, min(capacity_ah, soc_ah))
+
+            # Voltage anchors it, but only when voltage is worth listening to:
+            # at rest, and far enough past charging that surface charge is gone.
+            at_rest = abs(c) < REST_CURRENT_A * 1000
+            anchored = False
+            if at_rest and not settling:
+                soc_ah += ANCHOR_GAIN * (v_pct / 100.0 * capacity_ah - soc_ah)
+                anchored = True
+
+            # A pack that is charging, near full and tapering IS full. This is
+            # the one point on the curve where voltage is unambiguous.
+            if chg and (v_oc / CELLS) >= FULL_CELL_V and abs(c) < TAPER_CURRENT_A * 1000:
+                soc_ah = capacity_ah
+
+            # Learn capacity between two anchored points: charge moved divided by
+            # the fraction of the pack it moved through.
+            if anchored:
+                if anchor_ref is None:
+                    anchor_ref = (v_pct, soc_ah)
+                else:
+                    d_pct = v_pct - anchor_ref[0]
+                    d_ah  = soc_ah - anchor_ref[1]
+                    if abs(d_pct) >= CAP_LEARN_MIN_D and d_ah * d_pct > 0:
+                        est = abs(d_ah) / (abs(d_pct) / 100.0)
+                        if 0.1 < est < 10.0:
+                            capacity_ah += CAP_LEARN_GAIN * (est - capacity_ah)
+                            logging.info("capacity estimate %.3f Ah over %.0f points "
+                                         "-> now %.3f Ah", est, d_pct, capacity_ah)
+                        anchor_ref = (v_pct, soc_ah)
+
+            pct = 100.0 * soc_ah / capacity_ah
+            if now - last_save > 30:
+                _save_state({"soc_ah": soc_ah, "capacity_ah": capacity_ah, "ts": now})
+                last_save = now
+
             flag = " ~settling" if settling else ""
 
-            logging.info("%.3fV (oc %.3fV)  %+7.1fmA  %.3fW  %5.1f%%  [%s]%s",
-                         v, v_oc, c, pw, pct, state, flag)
+            logging.info("%.3fV (oc %.3fV)  %+7.1fmA  %.3fW  %5.1f%% (v %4.1f%%)  [%s]%s",
+                         v, v_oc, c, pw, pct, v_pct, state, flag)
 
         except Exception as exc:
             logging.error("Read error: %s", exc)
