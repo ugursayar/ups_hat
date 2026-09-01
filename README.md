@@ -313,3 +313,38 @@ Tested:
 Worst case, if the compensation misbehaves entirely, the raw floor at 5.60 V — 2.80 V/cell
 under load — still fires.
 
+
+## The supply is at its limit — the HackRF stops the pack charging
+
+Observed 2026-09-01: plugging in the HackRF made the reported charge fall several points
+immediately. It is real, and it is not the compensation.
+
+The PortaPack re-enumerated as `1d50:6018` (Mayhem UI mode, which is when it charges its
+own battery) and took the charger's entire surplus:
+
+| | mean pack current | percentage | terminal |
+|---|---|---|---|
+| before HackRF | **+227.5 mA** charging | 82.4 → 84.3 ↑ | 8.196 V |
+| after HackRF | **−21.4 mA** discharging | 84.7 → 81.5 ↓ | 8.024 V |
+| settled | +10 mA | flat | 8.03 V |
+
+**Not a compensation artifact.** At ~0 mA the correction is **6 mV** — the displayed figure
+is effectively raw terminal voltage, so the load-compensation work is not involved in this
+drop in either direction.
+
+Two real effects make it up:
+
+1. **Charging stopped.** The pack no longer gains from charge current, and briefly supplied.
+2. **Surface-charge relaxation.** A Li-ion cell reads high for 10–30 minutes after charging
+   and settles as the surface charge equalises. Part of that 84.7% was never really there.
+   Any percentage read within half an hour of charging is optimistic.
+
+### What it means operationally
+
+- **The Pi's pack will not recharge while the HackRF charges.** It sits balanced near 0 mA
+  and stays where it is.
+- **Extra load tips it negative.** Four busy cores draw 1.2 A here; with the HackRF also
+  charging, that comes out of the pack — **while plugged into mains**.
+
+Nothing unsafe: the protection works and the pack is at ~81%. But "on mains" no longer
+implies "charging", and for a long session the HackRF wants its own supply.
