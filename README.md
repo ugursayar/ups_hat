@@ -348,3 +348,59 @@ Two real effects make it up:
 
 Nothing unsafe: the protection works and the pack is at ~81%. But "on mains" no longer
 implies "charging", and for a long session the HackRF wants its own supply.
+
+
+## Surface charge: readings are optimistic for ~20 min after charging
+
+Unplugging the mains dropped the reported charge from **81% to ~50%** within six minutes.
+That looked like the compensation failing again. It was not — the 81% was the wrong number.
+
+**The compensation is working.** Two samples 30 s apart under very different load:
+
+```
+terminal 6.860 V @ -1324 mA  ->  V_oc 7.627
+terminal 7.196 V @  -847 mA  ->  V_oc 7.686
+         336 mV of terminal swing became 59 mV of V_oc  -- 82% of the load effect removed
+```
+
+At steady ~800 mA, V_oc held flat within **16 mV** over two minutes.
+
+**And the fall cannot be capacity.** V_oc went 8.13 → 7.61 V in six minutes at ~1.2 A, which
+is **0.12 Ah**. On the curve 4.06 → 3.81 V/cell is ~84% → ~50%; a 34-point fall from 0.12 Ah
+would need a **0.4 Ah pack**. This is 2× 18650, about 3 Ah. The arithmetic rules it out.
+
+What actually happened is **surface charge**. The pack had been charging until the HackRF took
+the charger's surplus, and a recently-charged cell sits well above its equilibrium voltage.
+A 1.2 A load strips that in minutes, and the sequence shows it settling rather than falling:
+
+```
+8.126 -> 7.987 -> 7.893 -> 7.797 -> 7.664 -> 7.627  then flat at 7.61-7.69
+```
+
+Real discharge does not level off like that.
+
+**This is inherent to any voltage-based state of charge**, not a flaw in this formula.
+Voltage reports the cell's equilibrium potential, and after charging it takes tens of minutes
+at rest — or minutes under load — to actually get there. The cure is **coulomb counting**:
+integrate the INA219's current, which measures charge directly, and demote voltage to a slow
+correction. Not yet done.
+
+Until then the log marks the window: `... 62.7% [CHG] ~settling`, for `SETTLE_SECS` (20 min)
+after charging stops.
+
+### R re-measured: 610 mΩ
+
+Fitted at ~1 A load, and **with a time term** — `V = a + b·t + R·I`. Over anything longer
+than a few tens of seconds the pack visibly drains, and a plain V-against-I fit charges that
+drift to the current instead. The same data gave **325 mΩ without the time term and 610 mΩ
+with it**; the residual fell from 126 mV to 16 mV.
+
+| measurement | span | R |
+|---|---|---|
+| **on battery, ~1 A load, time term** | 677 mA | **610 mΩ ← used** |
+| on battery, lighter load | 561 mA | 579 mΩ |
+| on mains, load step | 210 mA | 511 mΩ |
+| on mains, float noise | 396 mA | 602 mΩ |
+
+The spread is real: R depends on current, charge and temperature, so a single constant is an
+approximation. It is a good one — 610 vs 579 is 24 mV at 0.8 A — but it is not exact.

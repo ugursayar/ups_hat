@@ -66,6 +66,12 @@ CHARGING_THRESHOLD_MA = 50     # mA — above this = charging (legacy, see hyste
 CHG_ON_MA             = 80     # smoothed current above this -> charging
 CHG_OFF_MA            = 20     # and below this -> not charging
 CHG_SMOOTH_N          = 5      # samples in the moving average
+# A Li-ion cell sits well above its equilibrium voltage for a while after
+# charging, so a voltage-derived percentage reads high. Measured here: the pack
+# showed 81% on float, and once a 1.2 A load stripped the surface charge it
+# settled at ~50% having delivered only 0.12 Ah -- far too little to be capacity.
+# Any reading in this window is optimistic and is marked so.
+SETTLE_SECS           = 1200   # 20 min after charging stops
 CONFIRM_CYCLES        = 5      # consecutive low-voltage readings before warning
 SHUTDOWN_WARN_SECS    = 60     # countdown (seconds) from warning to poweroff
 
@@ -124,14 +130,19 @@ class INA219:
 # curve instead of a straight line.
 #
 # R measured 2026-09-01 by stepping CPU load and fitting V against I:
-#   ON BATTERY, mains unplugged  (561 mA span, residual sd 19.8 mV) -> 579 mOhm
+#   on battery, at ~1 A load     (677 mA span, residual sd 16.3 mV) -> 610 mOhm  <- used
+#   on battery, lighter load     (561 mA span, residual sd 19.8 mV) -> 579 mOhm
 #   on mains, load step          (210 mA span, residual sd  4.6 mV) -> 511 mOhm
 #   on mains, float noise only   (396 mA span, noisy about zero)    -> 602 mOhm
+# Fit R with a TIME TERM (V = a + b*t + R*I). Over anything longer than a few
+# tens of seconds the pack is visibly draining, and a plain V-against-I fit
+# charges that drift to the current: the same data gave 325 mOhm without the
+# time term and 610 mOhm with it.
 # Use the battery figure. Compensation only does anything while discharging, so
 # it should be measured in that topology -- and with the charger out of the loop
 # the span is nearly three times wider. The 68 mOhm gap against the mains figure
 # is the charger's own regulation, which is not in circuit when it matters.
-PACK_R_OHM = 0.579
+PACK_R_OHM = 0.610
 CELLS      = 2
 
 # Open-circuit volts per cell -> percent. Flat through the middle, which is what
@@ -185,6 +196,7 @@ def monitor():
 
     recent  = []          # rolling current, for the charging hysteresis
     chg     = False
+    last_charge_t = time.time()   # assume settling at start; it clears itself
 
     while True:
         try:
@@ -206,8 +218,14 @@ def monitor():
                 chg = True
             state = "CHG" if chg else "DIS"
 
-            logging.info("%.3fV (oc %.3fV)  %+7.1fmA  %.3fW  %5.1f%%  [%s]",
-                         v, v_oc, c, pw, pct, state)
+            # Mark the reading while surface charge is still dissipating.
+            if chg:
+                last_charge_t = time.time()
+            settling = (time.time() - last_charge_t) < SETTLE_SECS
+            flag = " ~settling" if settling else ""
+
+            logging.info("%.3fV (oc %.3fV)  %+7.1fmA  %.3fW  %5.1f%%  [%s]%s",
+                         v, v_oc, c, pw, pct, state, flag)
 
         except Exception as exc:
             logging.error("Read error: %s", exc)
