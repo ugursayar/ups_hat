@@ -49,6 +49,16 @@ I2C_ADDR              = 0x42   # INA219 address — verify with: i2cdetect -y 1
 POLL_INTERVAL_S       = 2      # seconds between readings
 LOW_VOLTAGE_V         = 6.4    # warn threshold  (≈ 3.20 V / cell on 2S pack)
 SHUTDOWN_VOLTAGE_V    = 6.2    # hard shutdown   (≈ 3.10 V / cell)
+# Both thresholds are evaluated against the LOAD-COMPENSATED voltage, which is
+# what "3.20 V / cell" was always meant to describe -- a resting figure, not a
+# terminal reading taken while the pack is delivering an amp. On raw terminal
+# volts they fired 230-700 mV early depending on load.
+#
+# Compensation can only ever RAISE the apparent voltage, so a bad current
+# reading delays shutdown. Two guards bound that:
+MAX_COMPENSATION_V    = 0.80   # cap the correction (≈1.4 A at 579 mOhm)
+RAW_FLOOR_V           = 5.60   # raw terminal volts; below this, go down regardless
+SANE_CURRENT_A        = 5.0    # |I| beyond this is a bad read -- do not compensate
 CHARGING_THRESHOLD_MA = 50     # mA — above this = charging (legacy, see hysteresis below)
 # The raw flag flipped CHG/DIS on noise: float current measures +4.3 mA mean
 # over -276..+120 mA, so it read 'charging' in 2% of samples while on mains.
@@ -133,8 +143,16 @@ _OCV_SOC = [
 ]
 
 def open_circuit_v(v_terminal, current_a):
-    """Undo the IR drop. current_a is positive when charging, as the INA219 reports."""
-    return v_terminal - PACK_R_OHM * current_a
+    """Undo the IR drop. current_a is positive when charging, as the INA219 reports.
+
+    Bounded deliberately: this figure gates the shutdown, and every error mode
+    of the compensation pushes it UP, which delays shutdown. An implausible
+    current reading is ignored, and the correction is capped."""
+    if abs(current_a) > SANE_CURRENT_A:
+        return v_terminal
+    corr = -PACK_R_OHM * current_a
+    corr = max(-MAX_COMPENSATION_V, min(MAX_COMPENSATION_V, corr))
+    return v_terminal + corr
 
 def soc_percent(v_oc):
     per_cell = v_oc / CELLS
@@ -196,21 +214,28 @@ def monitor():
             time.sleep(POLL_INTERVAL_S)
             continue
 
+        # ── Backstop: raw terminal volts, no compensation, no exceptions ──
+        if v < RAW_FLOOR_V:
+            logging.warning("RAW floor %.3fV < %.3fV — powering off NOW "
+                            "(compensation bypassed).", v, RAW_FLOOR_V)
+            os.system("sudo poweroff")
+            sys.exit(0)
+
         # ── Hard shutdown at absolute minimum ─────────────────────────────
-        if v < SHUTDOWN_VOLTAGE_V and not chg:
-            logging.warning("Hard shutdown voltage %.3fV < %.3fV — powering off NOW.", v, SHUTDOWN_VOLTAGE_V)
+        if v_oc < SHUTDOWN_VOLTAGE_V and not chg:
+            logging.warning("Hard shutdown: open-circuit %.3fV < %.3fV (terminal %.3fV) — powering off NOW.", v_oc, SHUTDOWN_VOLTAGE_V, v)
             os.system("sudo poweroff")
             sys.exit(0)
 
         # ── Soft warning + countdown ──────────────────────────────────────
-        if v < LOW_VOLTAGE_V and not chg:
+        if v_oc < LOW_VOLTAGE_V and not chg:
             low_count += 1
             if low_count >= CONFIRM_CYCLES and not warned:
                 warned = True
                 warn_start_time = time.time()
                 logging.warning(
-                    "Voltage low (%.3fV). Shutdown in %ds unless charger connected.",
-                    v, SHUTDOWN_WARN_SECS,
+                    "Open-circuit voltage low (%.3fV, terminal %.3fV). Shutdown in %ds "
+                    "unless charger connected.", v_oc, v, SHUTDOWN_WARN_SECS,
                 )
         else:
             if warned:
@@ -226,7 +251,7 @@ def monitor():
                 os.system("sudo poweroff")
                 sys.exit(0)
             else:
-                logging.info("  → shutdown in %.0f s (voltage=%.3fV)", remaining, v)
+                logging.info("  → shutdown in %.0f s (open-circuit=%.3fV, terminal=%.3fV)", remaining, v_oc, v)
 
         time.sleep(POLL_INTERVAL_S)
 

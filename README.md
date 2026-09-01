@@ -270,15 +270,46 @@ on battery to refine it.
 read "charging" in 2% of samples while on mains, flipping CHG/DIS at random. Replaced with
 hysteresis on a 5-sample average: on above 80 mA, off below 20 mA.
 
-## Shutdown thresholds
+## Shutdown thresholds — on compensated voltage (changed 2026-09-01)
 
 | condition | action |
 |---|---|
-| `v < 6.2 V` and not charging | **immediate `poweroff`**, no countdown |
-| `v < 6.4 V` and not charging, 5 consecutive reads (10 s) | warn, then **60 s countdown**; cancelled if voltage recovers or charging starts |
+| `v_oc < 6.2 V` and not charging | **immediate `poweroff`** |
+| `v_oc < 6.4 V` and not charging, 5 reads (10 s) | warn, then **60 s countdown**; cancelled if voltage recovers or charging starts |
+| **`v` (raw) < 5.6 V** | **immediate `poweroff`, compensation bypassed** |
 
-**These stayed on raw terminal voltage, deliberately.** Compensating them would let the
-pack run further down before shutdown — more runtime, less margin. Under a 1 A load the
-pack trips at 6.4 V terminal ≈ 7.0 V resting, so it shuts down **earlier** than strictly
-needed. That is the conservative direction, and after a deep discharge destroyed quali's
-eMMC on 2026-08-04 it is the right one. Changing it is a decision, not a cleanup.
+**`6.4` and `6.2` were always meant as resting per-cell figures** — 3.20 and 3.10 V/cell.
+Applied to a terminal reading taken while the pack delivers an amp they fired early:
+
+| load | fired at (terminal) before | now |
+|---|---|---|
+| 0.40 A | 6.40 V | 6.17 V |
+| 0.76 A | 6.40 V | 5.96 V |
+| 1.20 A | 6.40 V | 5.71 V |
+
+The gain in charge is modest — 3.42 V/cell is ~9% and 3.20 V/cell ~5%, because the curve
+is steep there — but the behaviour is now what the constants always claimed.
+
+### Three guards, because every error here delays shutdown
+
+Compensation can only **raise** the apparent voltage, so every way it can go wrong makes
+the Pi run longer on a flatter battery. Bounded three ways:
+
+| guard | value | catches |
+|---|---|---|
+| `SANE_CURRENT_A` | 5.0 A | a bad I²C read; beyond this, no compensation at all |
+| `MAX_COMPENSATION_V` | 0.80 V | a plausible-but-large current inflating V_oc (≈1.4 A at 579 mΩ) |
+| `RAW_FLOOR_V` | 5.60 V | everything else — raw terminal volts, no compensation, no `not charging` exemption |
+
+Tested:
+
+```
+6.40 V @  -0.76 A  ->  6.840   normal, +0.440 V
+6.40 V @ -20    A  ->  6.400   absurd current ignored
+6.40 V @  -4    A  ->  7.200   capped (uncapped would be 8.716)
+7.90 V @  +0.90 A  ->  7.379   charging, correction inverts
+```
+
+Worst case, if the compensation misbehaves entirely, the raw floor at 5.60 V — 2.80 V/cell
+under load — still fires.
+
