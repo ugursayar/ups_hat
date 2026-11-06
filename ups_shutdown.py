@@ -58,7 +58,12 @@ SHUTDOWN_VOLTAGE_V    = 6.2    # hard shutdown   (≈ 3.10 V / cell)
 # Compensation can only ever RAISE the apparent voltage, so a bad current
 # reading delays shutdown. Two guards bound that:
 MAX_COMPENSATION_V    = 0.80   # cap the correction (≈1.4 A at 579 mOhm)
-RAW_FLOOR_V           = 5.60   # raw terminal volts; below this, go down regardless
+RAW_FLOOR_V           = 6.10   # raw terminal volts; below this, go down regardless
+# Was 5.60, which sat BELOW where this box actually dies: on 2026-09-21 the Pi
+# lost power at 6.00 V terminal / 1.7 A with neither guard firing -- the capped
+# compensation held v_oc at 6.80 V, well above SHUTDOWN_VOLTAGE_V. Every sample
+# below 6.10 V since 2026-09-01 came from a near-empty pack (<= 9.5% by voltage),
+# so this costs no runtime; on 09-21 it would have fired 16 s before the cut.
 SANE_CURRENT_A        = 5.0    # |I| beyond this is a bad read -- do not compensate
 CHARGING_THRESHOLD_MA = 50     # mA — above this = charging (legacy, see hysteresis below)
 # The raw flag flipped CHG/DIS on noise: float current measures +4.3 mA mean
@@ -83,6 +88,11 @@ SETTLE_SECS           = 1200   # 20 min after charging stops
 # SAFETY: the shutdown thresholds stay on VOLTAGE. An integrator that has drifted
 # must never be able to talk the monitor out of powering off.
 STATE_FILE       = "/var/lib/ups_hat/state.json"
+# Published every sample for the tray and Fleet Command, so they show THIS
+# percentage instead of each re-deriving one from raw terminal volts (which
+# jumped 24% -> 84% in 4 s when the charger lifted the bus on 2026-11-05).
+# tmpfs, so a write every 2 s costs the SSD nothing.
+STATUS_FILE      = "/run/ups_hat/status.json"
 NOMINAL_CAP_AH   = 0.80    # seed only; learned from use. A discharge on
                            # 2026-09-01 implied 0.64 Ah, biased low by surface
                            # charge at the start, against ~2-3 Ah for healthy
@@ -205,6 +215,17 @@ def _save_state(d):
     except Exception as exc:                 # leave a half-written state file
         logging.debug("state save failed: %s", exc)
 
+def _write_status(d):
+    try:
+        os.makedirs(os.path.dirname(STATUS_FILE), mode=0o755, exist_ok=True)
+        tmp = STATUS_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(d, fh)
+        os.chmod(tmp, 0o644)                 # readers run as ugur
+        os.replace(tmp, STATUS_FILE)         # readers never see half a file
+    except Exception as exc:
+        logging.debug("status write failed: %s", exc)
+
 def soc_percent(v_oc):
     per_cell = v_oc / CELLS
     if per_cell >= _OCV_SOC[0][0]:
@@ -322,6 +343,14 @@ def monitor():
             if now - last_save > 30:
                 _save_state({"soc_ah": soc_ah, "capacity_ah": capacity_ah, "ts": now})
                 last_save = now
+
+            _write_status({
+                "ts": now, "pct": round(pct, 1), "v_pct": round(v_pct, 1),
+                "v": round(v, 3), "v_oc": round(v_oc, 3),
+                "current_ma": round(c, 1),        # positive = charging
+                "power_w": round(pw, 3), "state": state,
+                "settling": settling, "capacity_ah": round(capacity_ah, 3),
+            })
 
             flag = " ~settling" if settling else ""
 

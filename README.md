@@ -140,15 +140,20 @@ The INA219 measures current direction across the shunt resistor:
 
 ### Battery percentage
 
-Estimated from bus voltage using a linear approximation of the 2S Li-ion
-discharge curve:
+`ups_shutdown.py` owns the percentage — load-compensated voltage through a real Li-ion
+curve, with coulomb counting on top (see the sections below). It publishes every
+sample to **`/run/ups_hat/status.json`**, and the tray and Fleet Command read that file
+(since 2026-11-06), so all three show the same number.
+
+The original linear line through raw terminal volts,
 
 ```
 percent = (voltage − 6.0 V) / 2.4 V × 100
 ```
 
-This is a simplification; real Li-ion cells have a non-linear curve, so
-the reading will be most accurate in the middle of the range.
+survives only as the tray's and Fleet Command's **fallback** when the status file is
+missing or stale. Do not trust it: plugging in the charger lifts the terminal voltage
+~1.4 V in seconds, which this line reads as a 60-point jump (see below).
 
 ### Safe shutdown flow
 
@@ -299,7 +304,7 @@ the Pi run longer on a flatter battery. Bounded three ways:
 |---|---|---|
 | `SANE_CURRENT_A` | 5.0 A | a bad I²C read; beyond this, no compensation at all |
 | `MAX_COMPENSATION_V` | 0.80 V | a plausible-but-large current inflating V_oc (≈1.4 A at 579 mΩ) |
-| `RAW_FLOOR_V` | 5.60 V | everything else — raw terminal volts, no compensation, no `not charging` exemption |
+| `RAW_FLOOR_V` | 6.10 V *(5.60 until 2026-11-06)* | everything else — raw terminal volts, no compensation, no `not charging` exemption |
 
 Tested:
 
@@ -310,8 +315,9 @@ Tested:
 7.90 V @  +0.90 A  ->  7.379   charging, correction inverts
 ```
 
-Worst case, if the compensation misbehaves entirely, the raw floor at 5.60 V — 2.80 V/cell
-under load — still fires.
+Worst case, if the compensation misbehaves entirely, the raw floor — now 6.10 V, 3.05 V/cell
+under load — still fires. ⚠ At 5.60 V it was **below where this box actually dies**; see
+*The pack has failed* below for the 2026-09-21 power cut that slipped past all three guards.
 
 
 ## The supply is at its limit — the HackRF stops the pack charging
@@ -466,3 +472,88 @@ Simulated against a pack of known capacity:
 ⚠ The simulation derives voltage from true state of charge, so it contains **no surface
 charge** — it cannot demonstrate the thing this change exists for. That needs a real
 charge/discharge cycle to confirm.
+
+## The pack has failed — and why the percentage jumped on plug-in (2026-11-06)
+
+Reported as "the percentage becomes near full suddenly when connected to power". Three
+separate causes, one of them the cells.
+
+### 1. The tray and Fleet Command never got the 2026-09-01 fix
+
+Both still computed `(V − 6.0) / 2.4` on raw terminal volts. On 2026-11-05 at 14:08:
+
+| time | terminal | current | tray / Fleet Command | service counter |
+|---|---|---|---|---|
+| 14:08:14 (on battery) | 6.592 V | −1026 mA | **24 %** | 80.0 % |
+| 14:08:18 (plugged in) | 8.032 V | +208 mA | **84 %** | 80.0 % |
+| 14:12 | 8.25 V | +63 mA | **94 %** | 81.0 % |
+
+Sixty points in four seconds, with no charge moved — the charger lifting the bus. **Fixed:**
+the service now publishes `/run/ups_hat/status.json` (`pct`, `v_pct`, `v`, `v_oc`,
+`current_ma` positive = charging, `state`, `settling`, `capacity_ah`, `ts`; tmpfs, atomic,
+0644) and both readers use it when it is fresher than 10 s (tray) / 30 s (Fleet Command).
+
+Found along the way: **Fleet Command's charge direction was inverted for this box.** Its
+snippet read *shunt negative = charging* (true of the other INA219 modules in the fleet);
+here the shunt and current registers share a sign and **positive = charging** (verified
+2026-11-06), so on battery it said "charging". Fixed in the fallback path too.
+
+### 2. The counter also jumps — when the settling window expires
+
+The service's counter rose only 80.0 → 82.1 % in the first half hour on mains, then
+**82 → 92.6 % in ten minutes at 14:40** — exactly when `SETTLE_SECS` (20 min) ran out.
+After that any |I| < 50 mA counts as "at rest", and the anchor (gain 0.02/sample, τ ≈ 100 s)
+pulls the counter to the voltage opinion. On this box |I| < 50 mA **only ever happens on
+mains** (on battery the load is ≥ 0.6 A), so the anchor always reads the pack pinned at the
+charger's float (~8.25 V, ~92 %), never a true rest.
+
+Same root cause: **the capacity learner has never fired.** It needs two anchored points
+≥ 25 points apart, and every anchor lands near 92 %. `capacity_ah` is still the 0.80 Ah
+seed. **Not fixed yet** — pointless before the cells are replaced (below).
+
+### 3. The cells: usable charge fell ~5× in two weeks
+
+Integrated INA219 current per discharge since coulomb counting started:
+
+| discharge | duration | delivered | ended |
+|---|---|---|---|
+| 09-04 | 57 min | 0.70 Ah | plugged in at 2 % |
+| 09-07 | 35 min | 0.45 Ah | plugged in |
+| 09-08 | 33 min | 0.53 Ah | plugged in at 5.97 V |
+| 09-09 | 43 min | 0.70 Ah | plugged in at 5.86 V |
+| **09-21** | **7 min** | **0.135 Ah** | **power cut** |
+| **11-05** | **10 min** | **0.123 Ah** | voltage collapsing (V_oc 3.55 V/cell), plugged in |
+
+Charge acceptance collapsed with it: on 09-04 the pack took a steady **+870 mA** after
+plug-in; on 11-05 it took **+260 mA, tapering to +40 mA within four minutes**, and reached
+float having taken back ~0.02 Ah of the 0.12 Ah drawn. Dies in ten minutes, "fills" in
+four: the signature of a very high-impedance cell, most likely one of the two in series.
+So "near full quickly" is partly the pack, not the arithmetic — **no percentage
+calculation fixes this. Replace both 18650s with a matched pair.**
+
+With `capacity_ah` still at 0.80 Ah the counter is now **far too optimistic on battery**
+(it read 80 % on 11-05 as the voltage collapsed). Safety does not use it, but do not trust
+the displayed % on battery until the cells are replaced and capacity re-seeded.
+
+### The 09-21 power cut, and the raw floor raised to 6.10 V
+
+On 2026-09-21 at 13:22 the Pi lost power at **6.00 V terminal / 1.7 A** with the counter at
+73 %. No guard fired: the compensation, capped at +0.80 V, held V_oc at 6.80 V (far above
+the 6.2 V hard threshold), and the raw floor was 5.60 V. The clock rewinding to 13:19 on the
+next start (no RTC) marks it as a hard power loss, not a shutdown.
+
+`RAW_FLOOR_V` is now **6.10 V**. Every sample below 6.10 V since 2026-09-01 came from a
+near-empty pack (09-08, 09-09, 09-21; all ≤ 9.5 % by voltage), so it costs no runtime; on
+09-21 it would have fired **16 s before** the cut. 09-08 and 09-09 survived 5.97 / 5.86 V,
+so where the box browns out depends on the transient — 6.10 V is a margin, not a
+measured cliff.
+
+⚠ The tray still has its **own** shutdown on raw terminal volts < 6.4 V (unchanged). It
+fires early rather than late, so it was left alone.
+
+### After replacing the cells
+
+1. Stop the service, delete `/var/lib/ups_hat/state.json`, start it (re-seeds from voltage).
+2. Do one full discharge on battery to near-empty and set `capacity_ah` from the delivered
+   Ah, or make the learner work from discharges rather than from rest anchors.
+3. Consider gating the anchor on "not on mains" — on mains it reads the charger, not the pack.

@@ -11,6 +11,7 @@ Usage:
     python3 batteryTray.py
 """
 
+import json
 import os
 import sys
 import time
@@ -62,6 +63,23 @@ SHUTDOWN_SECS     = 60      # seconds of countdown before poweroff
 
 # Current threshold to distinguish charging from idle/discharging (mA)
 CHARGING_THRESHOLD_MA = 50
+
+# ups_shutdown.py publishes its percentage here every 2 s. Used when fresh; the
+# raw-voltage line above is only a fallback for when the service is down.
+STATUS_FILE       = "/run/ups_hat/status.json"
+STATUS_MAX_AGE_S  = 10
+
+
+def read_service_status():
+    """The service's latest reading, or None if missing or stale."""
+    try:
+        with open(STATUS_FILE) as fh:
+            st = json.load(fh)
+        if abs(time.time() - float(st["ts"])) <= STATUS_MAX_AGE_S:
+            return st
+    except Exception:
+        pass
+    return None
 
 
 # ── INA219 driver ─────────────────────────────────────────────────────────────
@@ -210,9 +228,17 @@ class Worker(QObject):
                 v   = ina.get_bus_voltage_v()
                 c   = ina.get_current_ma()    # mA
                 pw  = ina.get_power_w()
-                pct = (v - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V) * 100.0
-                pct = max(0.0, min(100.0, pct))
-                chg = c > CHARGING_THRESHOLD_MA
+                st  = read_service_status()
+                if st is not None:
+                    # The service's percentage: load-compensated and coulomb-
+                    # counted. Raw terminal volts jump ~60 points the moment the
+                    # charger lifts the bus, with no charge moved.
+                    pct = float(st["pct"])
+                    chg = st.get("state") == "CHG"
+                else:
+                    pct = (v - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V) * 100.0
+                    pct = max(0.0, min(100.0, pct))
+                    chg = c > CHARGING_THRESHOLD_MA
                 self.updated.emit(v, c / 1000.0, pw, pct, chg)
             except Exception as e:
                 logging.error(f"INA219 read error: {e}")
