@@ -507,9 +507,15 @@ pulls the counter to the voltage opinion. On this box |I| < 50 mA **only ever ha
 mains** (on battery the load is ≥ 0.6 A), so the anchor always reads the pack pinned at the
 charger's float (~8.25 V, ~92 %), never a true rest.
 
+> **Corrected later the same day:** the anchor was *not* misreading. After 20 min at float
+> with ~0 current the pack is at equilibrium, and ~92 % was right — the failed pack really
+> was "full" of the ~0.13 Ah it could still hold. The counter was what was wrong: it
+> believed 0.80 Ah, so 0.02 Ah back in looked like 2 points. The snap was the anchor
+> correcting a capacity 6× too large. The anchor is unchanged.
+
 Same root cause: **the capacity learner has never fired.** It needs two anchored points
 ≥ 25 points apart, and every anchor lands near 92 %. `capacity_ah` is still the 0.80 Ah
-seed. **Not fixed yet** — pointless before the cells are replaced (below).
+seed. **Fixed 2026-11-06** — see *Capacity learner, rewritten* below.
 
 ### 3. The cells: usable charge fell ~5× in two weeks
 
@@ -548,8 +554,17 @@ near-empty pack (09-08, 09-09, 09-21; all ≤ 9.5 % by voltage), so it costs no 
 so where the box browns out depends on the transient — 6.10 V is a margin, not a
 measured cliff.
 
-⚠ The tray still has its **own** shutdown on raw terminal volts < 6.4 V (unchanged). It
-fires early rather than late, so it was left alone.
+**The tray follows the service (since 2026-11-06).** `status.json` also carries `warn` and
+`shutdown_in` (seconds; 0 = powering off now), written after each sample's shutdown checks.
+While the file is fresh the tray only *mirrors* the service — a non-modal warning showing
+the service's countdown, dismissed when the service cancels — and **never powers off
+itself**. Its old rule (raw terminal volts < 6.4 V → 60 s → `poweroff`) runs only while the
+file is stale, i.e. the service is down and nothing else guards the pack; if the service
+comes back mid-countdown, the tray drops its own. On raw volts that rule fired 1–3 % before
+the service with the new cells, and far earlier on the worn pack (4× the sag). Tested
+headless with `poweroff` stubbed: 8/8 cases — service fine at raw 6.30 V → nothing; service
+warns → its countdown shown, tray ticks never power off; service cancels → dismissed;
+service stale → fallback countdown and poweroff; service returns → fallback stopped.
 
 ### Cells replaced — 2026-11-06
 
@@ -587,4 +602,59 @@ late, capped, at 1.4 A+) — the raw floor was the only guard working as designe
 1. Stop the service, delete `/var/lib/ups_hat/state.json`, start it (re-seeds from voltage).
 2. Do one full discharge on battery to near-empty and set `capacity_ah` from the delivered
    Ah, or make the learner work from discharges rather than from rest anchors.
-3. Consider gating the anchor on "not on mains" — on mains it reads the charger, not the pack.
+3. ~~Consider gating the anchor on "not on mains"~~ — withdrawn; the anchor was right (see
+   the correction under *2. The counter also jumps*).
+
+## Capacity learner, rewritten (2026-11-06)
+
+The old learner needed two **at-rest** readings ≥ 25 points apart. Here the pack is only at
+rest on mains at the charger's float (~92 %), so in two months it never fired, while the
+pack wore from ~0.9 Ah to ~0.13 Ah. It also measured charge with `soc_ah`, which the anchor
+itself moves and which clamps at 0 and full: circular.
+
+`CapacityLearner` (pure logic, no I/O):
+
+- **Reference** — the last anchored reading: at rest, ≥ 20 min past charging. Here that is
+  the pack at float, a genuine equilibrium.
+- **End point** — during the next discharge (≥ 150 mA), the IR-compensated V_oc averaged
+  over 60 s, once it is **≤ 3.55 V/cell (~12 %)**. Down there the curve runs ~22 %/V, so
+  the polarisation left after the IR correction — which always reads *low* on discharge —
+  costs ~2 points even at 100 mV/cell.
+- **Charge** — a separate signed coulomb total, never clamped or anchored.
+- Needs ≥ 40 points between the two; **one estimate per discharge**; any charging in between
+  voids the reference. The estimate moves capacity by `CAP_LEARN_GAIN` (25 %), the counter is
+  re-set on the end-point reading, and state is saved at once (a shutdown may follow).
+- **Shutdown logic is untouched** — still voltage only.
+
+**Why so deep.** With the end point at the curve's 3.74 V/cell boundary (20 %), replaying the
+old pack's discharges gave **0.63 / 0.56 Ah** against ~0.86–0.90 Ah delivered between trusted
+points: ~95 mV of polarisation had it reading 15 % with a third of its charge left.
+
+Tested — synthetic pack of known capacity, polarisation the IR correction does not remove:
+
+| case | estimate |
+|---|---|
+| 2.8 Ah, 0.75 A, no polarisation | 2.807 Ah (+0.2 %) |
+| 2.8 Ah, 0.75 A, 25 mV/cell | 2.789 Ah (−0.4 %) |
+| 2.8 Ah, 1.7 A, 50 mV/cell | 2.779 Ah (−0.7 %) |
+| failed pack 0.15 Ah | 0.156 Ah (+4 %) |
+| discharge stopped at 40 % | none (correct) |
+
+…and replayed against the real log (old pack):
+
+| discharge | ~truth | at 3.60 | **at 3.55** | at 3.50 | at 3.45 |
+|---|---|---|---|---|---|
+| 09-04 | 0.88 Ah | 0.724 | **0.788** | 0.854 | — |
+| 09-09 | 0.86 Ah | 0.630 | **0.674** | 0.713 | 0.753 |
+| 09-08 | — | 0.598 | **0.640** | — | — |
+| 09-07 (stopped at 44 %) | — | — | **—** | — | — |
+
+Deeper is more accurate but rarer: at 3.50 the 09-08 discharge teaches nothing, at 3.45 only
+one of three does. **3.55 learns from every discharge that nears shutdown, reads within 1 %
+on cells that polarise like healthy ones, and errs LOW (10–22 %) on a worn, high-resistance
+pack** — the safe direction: a pessimistic %. ⚠ The 11-05 collapse of the failed pack taught
+nothing: it was re-plugged before the 60 s average got below 3.55 V/cell. A failing pack that
+is allowed to run on towards shutdown is caught.
+
+The new pack has not yet been through a deep discharge, so **2.8 Ah is still the rated seed**.
+Watch for `capacity estimate` lines in `ups_shutdown.log` after the first one.

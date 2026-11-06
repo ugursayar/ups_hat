@@ -102,9 +102,30 @@ REST_CURRENT_A   = 0.05    # below this the pack is at rest and voltage is usabl
 ANCHOR_GAIN      = 0.02    # per sample, so a voltage correction takes ~2 min
 FULL_CELL_V      = 4.15    # at/above this while charging and tapering -> full
 TAPER_CURRENT_A  = 0.08
-CAP_LEARN_MIN_D  = 25.0    # points of anchored SoC change before trusting a
-                           # capacity estimate
 CAP_LEARN_GAIN   = 0.25
+# ── Capacity learning (rewritten 2026-11-06) ──────────────────────────────────
+# The old learner needed two AT-REST readings >= 25 points apart. On this box
+# the pack is only ever at rest on mains, at the charger's float (~92%), so in
+# two months it never fired: capacity sat at its 0.80 Ah seed while the real
+# pack wore from ~0.7 Ah to ~0.13 Ah. It also measured charge with soc_ah,
+# which the voltage anchor itself moves and which clamps at 0 and full.
+#
+# Now: REFERENCE = the last anchored reading (at rest, settled -- here, the pack
+# sitting at float for 20+ min, a genuine equilibrium). END POINT = a reading
+# late in the following discharge, IR-compensated and averaged over a minute,
+# once V_oc is below LEARN_END_CELL_V. Down there the curve runs ~22 %/V, so the
+# polarisation the IR correction leaves behind -- which always reads LOW on
+# discharge -- costs ~2 points even at 100 mV/cell. Higher up it does not:
+# replaying the old pack's 09-04 and 09-09 discharges with the end point at the
+# 3.74 V/cell boundary (20%) gave 0.63 / 0.56 Ah against ~0.86-0.90 Ah delivered
+# between trusted points, because ~95 mV of polarisation had the pack reading
+# 15% with a third of its charge still in it. So a discharge has to get near
+# shutdown before it teaches anything -- which is when capacity matters.
+# Charge is a separate, unclamped coulomb total. One estimate per discharge.
+LEARN_END_CELL_V = 3.55    # V_oc per cell (~12%) at or below which to measure
+LEARN_MIN_D      = 40.0    # SoC points between reference and end point
+LEARN_SMOOTH_N   = 30      # samples (60 s) of V_oc averaged for the end point
+LEARN_MIN_DIS_A  = 0.15    # end point must be a real discharge, not float noise
 CONFIRM_CYCLES        = 5      # consecutive low-voltage readings before warning
 SHUTDOWN_WARN_SECS    = 60     # countdown (seconds) from warning to poweroff
 
@@ -244,6 +265,51 @@ def soc_percent(v_oc):
             return s_lo + (per_cell - v_lo) / (v_hi - v_lo) * (s_hi - s_lo)
     return 0.0
 
+class CapacityLearner:
+    """Capacity from (charge moved) / (fraction of the pack it moved through),
+    between a rest reading and a late-discharge reading where voltage is precise.
+    Pure logic, no I/O -- see the comment block at LEARN_END_CELL_V."""
+
+    def __init__(self):
+        self.coulombs = 0.0   # Ah, signed (+ = charging), never clamped or anchored
+        self.ref = None       # (v_pct, coulombs) at the last anchored reading
+        self.win = []         # recent V_oc during the current discharge
+
+    def integrate(self, c_ma, dt):
+        self.coulombs += (c_ma / 1000.0) * dt / 3600.0
+
+    def update(self, v_oc, c_ma, v_pct, anchored, chg):
+        """Feed one sample. Returns (est_ah, d_pct, d_ah, end_pct) or None."""
+        if anchored:
+            self.ref = (v_pct, self.coulombs)
+            self.win.clear()
+            return None
+        if chg:                      # charge between the two points would add
+            self.ref = None          # surface charge to the end reading
+            self.win.clear()
+            return None
+        if self.ref is None or c_ma > -LEARN_MIN_DIS_A * 1000:
+            self.win.clear()
+            return None
+        self.win.append(v_oc)
+        del self.win[:-LEARN_SMOOTH_N]
+        if len(self.win) < LEARN_SMOOTH_N:
+            return None
+        v_avg = sum(self.win) / len(self.win)
+        if v_avg / CELLS > LEARN_END_CELL_V:
+            return None
+        end_pct = soc_percent(v_avg)
+        d_pct = self.ref[0] - end_pct
+        d_ah = self.ref[1] - self.coulombs
+        if d_pct < LEARN_MIN_D or d_ah <= 0:
+            return None
+        self.ref = None              # one estimate per discharge
+        self.win.clear()
+        est = d_ah / (d_pct / 100.0)
+        if not 0.1 < est < 10.0:
+            return None
+        return est, d_pct, d_ah, end_pct
+
 
 # ── Main monitoring loop ──────────────────────────────────────────────────────
 def monitor():
@@ -272,7 +338,7 @@ def monitor():
     soc_ah      = st.get("soc_ah")          # None on a first run
     last_t      = time.time()
     last_save   = 0.0
-    anchor_ref  = None                      # (voltage SoC %, coulombs since) for learning
+    learner     = CapacityLearner()
     if soc_ah is None:
         logging.info("no saved charge state — seeding from voltage on the first reading")
     else:
@@ -315,6 +381,7 @@ def monitor():
 
             if 0 < dt < 60:                       # ignore a suspended clock
                 soc_ah += (c / 1000.0) * dt / 3600.0
+                learner.integrate(c, dt)
             soc_ah = max(0.0, min(capacity_ah, soc_ah))
 
             # Voltage anchors it, but only when voltage is worth listening to:
@@ -330,34 +397,36 @@ def monitor():
             if chg and (v_oc / CELLS) >= FULL_CELL_V and abs(c) < TAPER_CURRENT_A * 1000:
                 soc_ah = capacity_ah
 
-            # Learn capacity between two anchored points: charge moved divided by
-            # the fraction of the pack it moved through.
-            if anchored:
-                if anchor_ref is None:
-                    anchor_ref = (v_pct, soc_ah)
-                else:
-                    d_pct = v_pct - anchor_ref[0]
-                    d_ah  = soc_ah - anchor_ref[1]
-                    if abs(d_pct) >= CAP_LEARN_MIN_D and d_ah * d_pct > 0:
-                        est = abs(d_ah) / (abs(d_pct) / 100.0)
-                        if 0.1 < est < 10.0:
-                            capacity_ah += CAP_LEARN_GAIN * (est - capacity_ah)
-                            logging.info("capacity estimate %.3f Ah over %.0f points "
-                                         "-> now %.3f Ah", est, d_pct, capacity_ah)
-                        anchor_ref = (v_pct, soc_ah)
+            # Learn capacity: rest reading -> precise point of the next discharge.
+            learned = learner.update(v_oc, c, v_pct, anchored, chg)
+            if learned:
+                est, d_pct, d_ah, end_pct = learned
+                old_cap = capacity_ah
+                capacity_ah += CAP_LEARN_GAIN * (est - capacity_ah)
+                # The end point is a trusted reading too: re-set the counter on it,
+                # so a capacity that was wrong does not leave the % wrong as well.
+                soc_ah = end_pct / 100.0 * capacity_ah
+                logging.info("capacity estimate %.3f Ah (%.3f Ah over %.0f points, "
+                             "ending at %.1f%%) -> %.3f Ah, was %.3f",
+                             est, d_ah, d_pct, end_pct, capacity_ah, old_cap)
+                last_save = 0.0                   # persist now, before any shutdown
 
             pct = 100.0 * soc_ah / capacity_ah
             if now - last_save > 30:
                 _save_state({"soc_ah": soc_ah, "capacity_ah": capacity_ah, "ts": now})
                 last_save = now
 
-            _write_status({
+            # Published after the shutdown checks below, so it carries this
+            # sample's warning state; the tray shows that rather than deciding
+            # for itself (since 2026-11-06).
+            status = {
                 "ts": now, "pct": round(pct, 1), "v_pct": round(v_pct, 1),
                 "v": round(v, 3), "v_oc": round(v_oc, 3),
                 "current_ma": round(c, 1),        # positive = charging
                 "power_w": round(pw, 3), "state": state,
                 "settling": settling, "capacity_ah": round(capacity_ah, 3),
-            })
+                "warn": False, "shutdown_in": None,
+            }
 
             flag = " ~settling" if settling else ""
 
@@ -373,12 +442,14 @@ def monitor():
         if v < RAW_FLOOR_V:
             logging.warning("RAW floor %.3fV < %.3fV — powering off NOW "
                             "(compensation bypassed).", v, RAW_FLOOR_V)
+            _write_status(dict(status, warn=True, shutdown_in=0))
             os.system("sudo poweroff")
             sys.exit(0)
 
         # ── Hard shutdown at absolute minimum ─────────────────────────────
         if v_oc < SHUTDOWN_VOLTAGE_V and not chg:
             logging.warning("Hard shutdown: open-circuit %.3fV < %.3fV (terminal %.3fV) — powering off NOW.", v_oc, SHUTDOWN_VOLTAGE_V, v)
+            _write_status(dict(status, warn=True, shutdown_in=0))
             os.system("sudo poweroff")
             sys.exit(0)
 
@@ -403,11 +474,14 @@ def monitor():
             remaining = SHUTDOWN_WARN_SECS - elapsed
             if remaining <= 0:
                 logging.warning("Countdown expired — initiating safe shutdown.")
+                _write_status(dict(status, warn=True, shutdown_in=0))
                 os.system("sudo poweroff")
                 sys.exit(0)
             else:
                 logging.info("  → shutdown in %.0f s (open-circuit=%.3fV, terminal=%.3fV)", remaining, v_oc, v)
+                status.update(warn=True, shutdown_in=int(remaining))
 
+        _write_status(status)
         time.sleep(POLL_INTERVAL_S)
 
 

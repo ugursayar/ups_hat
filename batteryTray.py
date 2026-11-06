@@ -213,8 +213,9 @@ def make_battery_icon(percent: float, charging: bool, size: int = 22) -> QIcon:
 class Worker(QObject):
     """Polls the INA219 in a background thread and emits readings."""
 
-    # voltage_v, current_a, power_w, percent (0–100), charging
-    updated = pyqtSignal(float, float, float, float, bool)
+    # voltage_v, current_a, power_w, percent (0–100), charging,
+    # service status (dict) or None when ups_shutdown.py's file is stale
+    updated = pyqtSignal(float, float, float, float, bool, object)
 
     def run(self):
         try:
@@ -239,7 +240,7 @@ class Worker(QObject):
                     pct = (v - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V) * 100.0
                     pct = max(0.0, min(100.0, pct))
                     chg = c > CHARGING_THRESHOLD_MA
-                self.updated.emit(v, c / 1000.0, pw, pct, chg)
+                self.updated.emit(v, c / 1000.0, pw, pct, chg, st)
             except Exception as e:
                 logging.error(f"INA219 read error: {e}")
             time.sleep(POLL_INTERVAL_S)
@@ -247,7 +248,14 @@ class Worker(QObject):
 
 # ── Main window / tray ────────────────────────────────────────────────────────
 class BatteryTray(QMessageBox):
-    """System-tray battery monitor with low-voltage warning and safe shutdown."""
+    """System-tray battery monitor with low-voltage warning and safe shutdown.
+
+    Since 2026-11-06 it FOLLOWS ups_shutdown.py: while the service's status file
+    is fresh, the tray shows the service's warning and countdown and never powers
+    off itself. Its own raw-terminal-volts shutdown (< LOW_VOLTAGE_V, 60 s) runs
+    only while that file is stale -- i.e. the service is down and nothing else is
+    guarding the pack. On raw volts it fired 1-3% earlier than the service (and
+    far earlier on the worn pack, whose sag was 4x larger)."""
 
     def __init__(self):
         super().__init__()
@@ -257,6 +265,7 @@ class BatteryTray(QMessageBox):
         self._voltage   = 0.0
         self._msgBox    = None
         self._counter   = 0
+        self._following = False   # True while the service's status is fresh
 
         # ── Tray icon ──
         self.tray = QSystemTrayIcon(self)
@@ -288,6 +297,10 @@ class BatteryTray(QMessageBox):
 
     # ── Countdown tick ────────────────────────────────────────────────────────
     def _on_tick(self):
+        if self._following:
+            # The service is back and owns the decision; drop our own countdown.
+            self._timer.stop()
+            return
         if self._charging:
             # Charger connected — cancel shutdown
             self._dismiss_warning()
@@ -303,17 +316,42 @@ class BatteryTray(QMessageBox):
                     f"Auto-shutdown in {self._counter} second(s)."
                 )
 
-    def _dismiss_warning(self):
+    def _dismiss_warning(self, why="Charger detected — shutdown cancelled."):
         self._timer.stop()
         if self._msgBox:
             self._msgBox.hide()
             self._msgBox.close()
             self._msgBox = None
-        logging.info("Charger detected — shutdown cancelled.")
+        logging.info(why)
+
+    def _follow_service(self, svc):
+        """Mirror the service's warning; the service does the poweroff."""
+        if self._timer.isActive():
+            self._timer.stop()            # our fallback countdown, superseded
+        if svc.get("warn"):
+            left = svc.get("shutdown_in")
+            info = ("Shutting down now…" if left == 0 else
+                    f"The UPS service will shut down in {left} second(s).")
+            if self._msgBox is None:
+                logging.warning("UPS service warns: battery low — %s", info)
+                self._msgBox = QMessageBox(
+                    QMessageBox.Warning,
+                    "⚠  Battery Warning",
+                    "<b>Battery is nearly empty!</b><br>"
+                    "Please connect the power adapter.",
+                )
+                self._msgBox.setStandardButtons(QMessageBox.NoButton)
+                self._msgBox.setInformativeText(info)
+                self._msgBox.show()       # non-modal: the service owns the countdown
+            else:
+                self._msgBox.setInformativeText(info)
+        elif self._msgBox is not None:
+            self._dismiss_warning("UPS service cancelled the shutdown.")
 
     # ── Data refresh (called from worker signal) ──────────────────────────────
     def _refresh(self, voltage: float, current_a: float, power_w: float,
-                 percent: float, charging: bool):
+                 percent: float, charging: bool, svc=None):
+        self._following = svc is not None
         self._charging = charging
         self._percent  = percent
         self._voltage  = voltage
@@ -324,6 +362,8 @@ class BatteryTray(QMessageBox):
 
         state = "Charging ⚡" if charging else "Discharging"
         tooltip = f"{percent:.0f}%  {voltage:.3f} V  {current_a:+.3f} A  [{state}]"
+        if svc is None:
+            tooltip += "  (own reading — UPS service not running)"
         self.tray.setToolTip(tooltip)
         logging.info(tooltip)
 
@@ -338,6 +378,10 @@ class BatteryTray(QMessageBox):
         )
 
         # ── Low-voltage logic ──────────────────────────────────────────────
+        if svc is not None:
+            self._follow_service(svc)
+            return
+        # Fallback only: the service is down, so guard the pack ourselves.
         if voltage < LOW_VOLTAGE_V and not charging:
             if self._msgBox is None:
                 self._counter = SHUTDOWN_SECS
