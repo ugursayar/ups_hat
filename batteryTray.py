@@ -360,7 +360,13 @@ class BatteryTray(QMessageBox):
         self.tray.setIcon(icon)
         self.setIconPixmap(icon.pixmap(48, 48))
 
-        state = "Charging ⚡" if charging else "Discharging"
+        if svc is not None:
+            # The service's three-way state; "not charging" is not "discharging".
+            state = {"charging": "Charging ⚡", "discharging": "Discharging",
+                     "ac": "On AC — full" if percent >= 95 else "On AC"}.get(
+                         svc.get("power"), "Charging ⚡" if charging else "Discharging")
+        else:
+            state = "Charging ⚡" if charging else "Discharging"
         tooltip = f"{percent:.0f}%  {voltage:.3f} V  {current_a:+.3f} A  [{state}]"
         if svc is None:
             tooltip += "  (own reading — UPS service not running)"

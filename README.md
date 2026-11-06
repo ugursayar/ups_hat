@@ -566,6 +566,17 @@ headless with `poweroff` stubbed: 8/8 cases — service fine at raw 6.30 V → n
 warns → its countdown shown, tray ticks never power off; service cancels → dismissed;
 service stale → fallback countdown and poweroff; service returns → fallback stopped.
 
+**A third charge state: on AC (2026-11-06).** The service's `state` is only `CHG` / `DIS`, and
+`DIS` means *not charging* — the tray printed it as "Discharging" while the pack sat on mains
+topping off at +30…+60 mA, and Fleet Command flashed 🔋 on any instant reading below −100 mA
+(float current swings −198…+114 mA). `status.json` now also carries **`power`** =
+`charging` / `discharging` / `ac`, from the 10 s average current with hysteresis: draining
+below **−250 mA**, released above **−150 mA**. Over 11-05…06 that average sat above −81 mA 99 %
+of the time on mains and never above −401 mA on battery. A pack that genuinely drains on
+mains (supply at its limit, see above) reads `discharging`, which is true. The tray shows
+"Charging ⚡" / "Discharging" / "On AC" / "On AC — full" (≥ 95 %); Fleet Command maps the same
+field to ⚡ / 🔋 / 🔌 / ✓.
+
 ### Cells replaced — 2026-11-06
 
 Old: **PROFUSE 2600 mAh** ×2 — already down to 0.70 Ah (27 % of rating) at the start of

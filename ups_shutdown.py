@@ -72,6 +72,14 @@ CHARGING_THRESHOLD_MA = 50     # mA — above this = charging (legacy, see hyste
 CHG_ON_MA             = 80     # smoothed current above this -> charging
 CHG_OFF_MA            = 20     # and below this -> not charging
 CHG_SMOOTH_N          = 5      # samples in the moving average
+# A third state, for the displays: neither charging nor draining = on AC.
+# 'DIS' only ever meant "not charging", and the tray printed it as
+# "Discharging" while the pack sat on mains topping off at +30..+60 mA.
+# Over 2026-11-05..06 the 10 s average sat above -81 mA 99% of the time on
+# mains and never above -401 mA on battery. A pack that genuinely drains on
+# mains (supply at its limit, see README) still reads 'discharging' -- true.
+DRAIN_ON_MA           = -250   # smoothed current below this -> discharging
+DRAIN_OFF_MA          = -150   # and above this -> not
 # A Li-ion cell sits well above its equilibrium voltage for a while after
 # charging, so a voltage-derived percentage reads high. Measured here: the pack
 # showed 81% on float, and once a 1.2 A load stripped the surface charge it
@@ -330,6 +338,7 @@ def monitor():
 
     recent  = []          # rolling current, for the charging hysteresis
     chg     = False
+    draining = False
     last_charge_t = time.time()   # assume settling at start; it clears itself
 
     # ── coulomb counter ──────────────────────────────────────────────────────
@@ -364,6 +373,11 @@ def monitor():
             elif not chg and c_avg > CHG_ON_MA:
                 chg = True
             state = "CHG" if chg else "DIS"
+            if draining and c_avg > DRAIN_OFF_MA:
+                draining = False
+            elif not draining and c_avg < DRAIN_ON_MA:
+                draining = True
+            power = "charging" if chg else ("discharging" if draining else "ac")
 
             # Mark the reading while surface charge is still dissipating.
             if chg:
@@ -424,6 +438,7 @@ def monitor():
                 "v": round(v, 3), "v_oc": round(v_oc, 3),
                 "current_ma": round(c, 1),        # positive = charging
                 "power_w": round(pw, 3), "state": state,
+                "power": power,                   # charging | discharging | ac
                 "settling": settling, "capacity_ah": round(capacity_ah, 3),
                 "warn": False, "shutdown_in": None,
             }
