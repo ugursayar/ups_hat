@@ -551,6 +551,37 @@ measured cliff.
 ⚠ The tray still has its **own** shutdown on raw terminal volts < 6.4 V (unchanged). It
 fires early rather than late, so it was left alone.
 
+### Cells replaced — 2026-11-06
+
+Old: **PROFUSE 2600 mAh** ×2 — already down to 0.70 Ah (27 % of rating) at the start of
+September, ~0.13 Ah (5 %) by 09-21. New: **Aspilsan INR18650A28, 2800 mAh / 25 A** ×2, so
+**2.8 Ah** for the series pack. `NOMINAL_CAP_AH` is now 2.80; the old state was moved to
+`/var/lib/ups_hat/state.json.old-pack-20261106` and the counter re-seeded from voltage
+(89 % at 12:50, on mains, charging). Step 1 below is done; 2 and 3 are not.
+
+### Plug test with the new cells — no jump (2026-11-06)
+
+Mains pulled at 13:54:07 and restored at 13:55:46, recorded every 2 s from the service,
+the tray and Fleet Command (on lapivaio) side by side:
+
+| | service | tray | Fleet Command |
+|---|---|---|---|
+| on mains, before | 92.3 % | 92 % | 92 % 🔌 |
+| 1.5 min on battery (−0.73 A) | 92.3 → 91.7 % | 92 % | 92 → 91 % 🔋 |
+| re-plugged, +3 min | 91.7 → 91.9 % | 92 % | 91 % ⚡ |
+
+No jump either way. The 0.6-point fall is the coulomb count: 0.73 A × 99 s = 0.020 Ah of
+2.8 Ah. Fleet Command's icon followed within one poll (🔋 → 🔌 → ⚡ over ~15 s, the service's
+charging hysteresis included). For contrast, raw volts read 8.13 V on battery and 8.26 V
+on mains: the old line would have stepped 88.7 → 94.2 %.
+
+**It exposed a stale `PACK_R_OHM`.** Both mains steps measure the new pack at
+**140 mΩ** (unplug 137–139, re-plug 136–143) — against 610 mΩ for the worn pack, itself a
+symptom of the failing cell. With 0.610 left in, V_oc read **8.60 V under a 0.73 A load
+(100 % by voltage)**, and every threshold on V_oc fired ~0.35 V late at that current (0.8 V
+late, capped, at 1.4 A+) — the raw floor was the only guard working as designed.
+`PACK_R_OHM` is now **0.140**: on battery V_oc reads 8.23 V, agreeing with the counter.
+
 ### After replacing the cells
 
 1. Stop the service, delete `/var/lib/ups_hat/state.json`, start it (re-seeds from voltage).

@@ -93,11 +93,11 @@ STATE_FILE       = "/var/lib/ups_hat/state.json"
 # jumped 24% -> 84% in 4 s when the charger lifted the bus on 2026-11-05).
 # tmpfs, so a write every 2 s costs the SSD nothing.
 STATUS_FILE      = "/run/ups_hat/status.json"
-NOMINAL_CAP_AH   = 0.80    # seed only; learned from use. A discharge on
-                           # 2026-09-01 implied 0.64 Ah, biased low by surface
-                           # charge at the start, against ~2-3 Ah for healthy
-                           # 18650s -- so treat a low learned value as a real
-                           # statement about the pack, not a bug.
+NOMINAL_CAP_AH   = 2.80    # seed only. Rated capacity of the cells fitted
+                           # 2026-11-06: 2x Aspilsan INR18650A28 (2800 mAh, 25 A)
+                           # in series, so 2.8 Ah for the pack. The previous
+                           # PROFUSE 2600 mAh pair had worn to ~0.13 Ah usable;
+                           # 0.80 was the seed measured on that worn pack.
 REST_CURRENT_A   = 0.05    # below this the pack is at rest and voltage is usable
 ANCHOR_GAIN      = 0.02    # per sample, so a voltage correction takes ~2 min
 FULL_CELL_V      = 4.15    # at/above this while charging and tapering -> full
@@ -175,7 +175,14 @@ class INA219:
 # it should be measured in that topology -- and with the charger out of the loop
 # the span is nearly three times wider. The 68 mOhm gap against the mains figure
 # is the charger's own regulation, which is not in circuit when it matters.
-PACK_R_OHM = 0.610
+#
+# NEW CELLS 2026-11-06 (Aspilsan INR18650A28): 140 mOhm, from the two mains
+# steps of a plug test -- unplug 8.264 V/-0.028 A -> 8.168 V/-0.729 A = 137-139,
+# re-plug 8.128 V/-0.753 A -> 8.252 V/+0.156 A = 136-143. Two-second steps, so
+# no time term is needed. With the old 0.610 left in, V_oc read 8.60 V under a
+# 0.73 A load (100% by voltage) and every shutdown threshold fired ~0.35 V late.
+# The worn pack's 610 above was itself a symptom of its failing cell.
+PACK_R_OHM = 0.140
 CELLS      = 2
 
 # Open-circuit volts per cell -> percent. Flat through the middle, which is what
