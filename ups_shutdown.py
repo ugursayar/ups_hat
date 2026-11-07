@@ -108,7 +108,10 @@ NOMINAL_CAP_AH   = 2.80    # seed only. Rated capacity of the cells fitted
                            # 0.80 was the seed measured on that worn pack.
 REST_CURRENT_A   = 0.05    # below this the pack is at rest and voltage is usable
 ANCHOR_GAIN      = 0.02    # per sample, so a voltage correction takes ~2 min
-FULL_CELL_V      = 4.15    # at/above this while charging and tapering -> full
+FULL_CELL_V      = 4.12    # V_oc/cell at/above this while charging and tapering -> full.
+                           # Was 4.15, which this charger never reaches under taper:
+                           # on 2026-11-07 it finished at 8.264 V / +41 mA (V_oc 4.13
+                           # per cell), so the counter sat at 85.7% until the anchor.
 TAPER_CURRENT_A  = 0.08
 CAP_LEARN_GAIN   = 0.25
 # ── Capacity learning (rewritten 2026-11-06) ──────────────────────────────────
@@ -262,8 +265,16 @@ def _write_status(d):
     except Exception as exc:
         logging.debug("status write failed: %s", exc)
 
-def soc_percent(v_oc):
-    per_cell = v_oc / CELLS
+# The HAT's charger stops short of 4.20 V/cell. A full pack rests at 8.28-8.30 V
+# (4.14-4.15 V/cell), which the cell curve above calls ~94%, so "full" showed
+# 94.4% forever (2026-11-07). The published % is therefore a share of what THIS
+# charger fills: the chemistry curve divided by its value at CHARGER_FULL_CELL_V
+# and capped at 100. A uniform scale keeps the learner consistent (it measures
+# capacity in the same points it then divides by). Shutdown never reads a percent.
+CHARGER_FULL_CELL_V = 4.14
+
+def _cell_soc(per_cell):
+    """Chemistry state of charge, 0-100 against a 4.20 V/cell full."""
     if per_cell >= _OCV_SOC[0][0]:
         return 100.0
     if per_cell <= _OCV_SOC[-1][0]:
@@ -272,6 +283,12 @@ def soc_percent(v_oc):
         if v_lo <= per_cell <= v_hi:
             return s_lo + (per_cell - v_lo) / (v_hi - v_lo) * (s_hi - s_lo)
     return 0.0
+
+FULL_FRACTION = _cell_soc(CHARGER_FULL_CELL_V) / 100.0   # 0.94
+
+def soc_percent(v_oc):
+    """Percent of what this charger fills, 0-100."""
+    return min(100.0, _cell_soc(v_oc / CELLS) / FULL_FRACTION)
 
 class CapacityLearner:
     """Capacity from (charge moved) / (fraction of the pack it moved through),
@@ -343,7 +360,15 @@ def monitor():
 
     # ── coulomb counter ──────────────────────────────────────────────────────
     st          = _load_state()
-    capacity_ah = float(st.get("capacity_ah", NOMINAL_CAP_AH))
+    capacity_ah = float(st.get("capacity_ah", NOMINAL_CAP_AH * FULL_FRACTION))
+    # Capacity is stored on the scale it was learned on (1.0 = the 4.20 V/cell
+    # chemistry full, before 2026-11-07). Convert it once to the charger-full scale.
+    old_frac = float(st.get("full_fraction", 1.0))
+    if "capacity_ah" in st and abs(old_frac - FULL_FRACTION) > 1e-6:
+        new_cap = capacity_ah * FULL_FRACTION / old_frac
+        logging.info("capacity rescaled to charger-full: %.3f Ah -> %.3f Ah",
+                     capacity_ah, new_cap)
+        capacity_ah = new_cap
     soc_ah      = st.get("soc_ah")          # None on a first run
     last_t      = time.time()
     last_save   = 0.0
@@ -427,7 +452,8 @@ def monitor():
 
             pct = 100.0 * soc_ah / capacity_ah
             if now - last_save > 30:
-                _save_state({"soc_ah": soc_ah, "capacity_ah": capacity_ah, "ts": now})
+                _save_state({"soc_ah": soc_ah, "capacity_ah": capacity_ah,
+                             "full_fraction": FULL_FRACTION, "ts": now})
                 last_save = now
 
             # Published after the shutdown checks below, so it carries this

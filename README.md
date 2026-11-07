@@ -669,3 +669,24 @@ is allowed to run on towards shutdown is caught.
 
 The new pack has not yet been through a deep discharge, so **2.8 Ah is still the rated seed**.
 Watch for `capacity estimate` lines in `ups_shutdown.log` after the first one.
+
+## Full reads 100% — the % is now a share of what this charger fills (2026-11-07)
+
+**Symptom**: after a full overnight charge the reading sat at **94.4%** for hours. The pack was full:
+the charger had finished at ~02:40 (8.264 V, +41 mA taper), and on mains it then rested at
+**8.28–8.30 V = 4.14–4.15 V/cell**. The 13-point cell curve reaches 100% only at 4.20 V/cell, so
+it called that ~94%.
+
+**Change** (`ups_shutdown.py`):
+- `soc_percent()` = chemistry curve ÷ its value at **`CHARGER_FULL_CELL_V = 4.14`**
+  (`FULL_FRACTION` = 0.94), capped at 100. The scale is uniform, so the learner stays consistent:
+  it measures capacity in the same points it then divides by. Low end moves by ≤ 0.6 points
+  (6.9 V: 10.0 → 10.6%).
+- **Stored capacity converted once**: `state.json` now records `full_fraction`. A state without it
+  is on the old 1.0 scale and is multiplied by 0.94 on load (2.713 → **2.551 Ah**, logged as
+  `capacity rescaled to charger-full`). The seed for a fresh state is `NOMINAL_CAP_AH × 0.94`.
+- **`FULL_CELL_V` 4.15 → 4.12**: the "charging + tapering ⇒ full" snap never fired, because under
+  taper this charger's V_oc is ~4.13 V/cell. That is why the counter read 85.7% at end of charge
+  and jumped to 93% only when the 20-min anchor kicked in.
+- **Shutdown is untouched**: every threshold compares volts (V_oc 6.4/6.2 V, raw floor 6.10 V),
+  never a percent.
