@@ -16,6 +16,7 @@ Or run once:
     sudo python3 ups_shutdown.py
 """
 
+import errno
 import json
 import os
 import sys
@@ -101,6 +102,11 @@ STATE_FILE       = "/var/lib/ups_hat/state.json"
 # jumped 24% -> 84% in 4 s when the charger lifted the bus on 2026-11-05).
 # tmpfs, so a write every 2 s costs the SSD nothing.
 STATUS_FILE      = "/run/ups_hat/status.json"
+# Written instead when the HAT is not there at all (see _probe_absent): the
+# watchdog, the tray and blackbox read it and stand down. Fleet Command is to
+# read it too and drop its own I2C fallback read of 0x42 (a change made on
+# lapivaio; until then it still reads the empty bus on each probe).
+ABSENT_FILE      = "/run/ups_hat/absent.json"
 NOMINAL_CAP_AH   = 2.80    # seed only. Rated capacity of the cells fitted
                            # 2026-11-06: 2x Aspilsan INR18650A28 (2800 mAh, 25 A)
                            # in series, so 2.8 Ah for the pack. The previous
@@ -336,6 +342,77 @@ class CapacityLearner:
         return est, d_pct, d_ah, end_pct
 
 
+# ── Is the HAT there at all? (2026-11-24) ─────────────────────────────────────
+# mediapi's UPS HAT was removed for good on 2026-11-24 (its 2.5 A regulator was
+# the box's power limit). With nothing at 0x42 the INA219 init failed at once,
+# every 10 s, for ever, and ups-watchdog -- seeing no status file -- counted
+# down to a clean poweroff of a box on mains. Now this start-up IS the
+# detection, done by the bus's only master (this service), so nothing else
+# ever probes I2C:
+#   - nothing there: every attempt fails at once with EIO (this Pi 4's
+#     i2c-bcm2835 on a NACK; EREMOTEIO / ENXIO on other drivers), or the bus
+#     device is missing (I2C off). Absent only when ALL of ABSENT_TRIES
+#     attempts, ABSENT_GAP_S apart, fail that way: a lone EIO has been a glitch
+#     with the HAT on (3 times in this log until 2026-11-24).
+#   - a wedged bus with the HAT on fails with ETIMEDOUT (517 times in the same
+#     log) -- not absence: exit 1 as before, systemd retries, the watchdog alerts.
+# Absent -> ABSENT_FILE, and exit EXIT_ABSENT, which the unit's drop-in lists
+# as SuccessExitStatus + RestartPreventExitStatus: inactive, not failed, not
+# retried until the next boot (or a manual start once the HAT is back).
+ABSENT_ERRNOS = {errno.EIO, errno.EREMOTEIO, errno.ENXIO, errno.ENOENT}
+ABSENT_TRIES  = 3
+ABSENT_GAP_S  = 1.5
+EXIT_ABSENT   = 3
+
+
+def _probe_absent():
+    """The INA219, initialised -- or exit: EXIT_ABSENT when the HAT is not
+    there, 1 on any other failure."""
+    errs, last = [], None
+    for attempt in range(ABSENT_TRIES):
+        try:
+            ina = INA219()
+        except OSError as exc:
+            errs.append(exc.errno)
+            last = exc
+            if exc.errno not in ABSENT_ERRNOS:
+                break
+            if attempt < ABSENT_TRIES - 1:
+                time.sleep(ABSENT_GAP_S)
+            continue
+        except Exception as exc:
+            errs.append(None)
+            last = exc
+            break
+        try:
+            os.remove(ABSENT_FILE)              # the HAT is back
+            logging.info("UPS HAT found again at 0x%02X", I2C_ADDR)
+        except FileNotFoundError:
+            pass
+        return ina
+    if len(errs) == ABSENT_TRIES and all(e in ABSENT_ERRNOS for e in errs):
+        logging.warning("No UPS HAT: nothing answers at 0x%02X on I2C-%d (%d tries, %s). "
+                        "Nothing to guard -- exiting; the box runs on mains.",
+                        I2C_ADDR, 1, ABSENT_TRIES, last)
+        try:
+            os.makedirs(os.path.dirname(ABSENT_FILE), mode=0o755, exist_ok=True)
+            tmp = ABSENT_FILE + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump({"ts": time.time(), "absent": True, "addr": "0x%02X" % I2C_ADDR,
+                           "why": str(last)}, fh)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, ABSENT_FILE)
+        except OSError as exc:
+            logging.error("cannot write %s: %s", ABSENT_FILE, exc)
+        try:
+            os.remove(STATUS_FILE)              # nothing may read an old sample as current
+        except FileNotFoundError:
+            pass
+        sys.exit(EXIT_ABSENT)
+    logging.critical("Cannot initialise INA219: %s", last)
+    sys.exit(1)
+
+
 # ── Main monitoring loop ──────────────────────────────────────────────────────
 def monitor():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
@@ -343,11 +420,7 @@ def monitor():
 
     logging.info("UPS shutdown monitor starting (addr=0x%02X, low=%.2fV)", I2C_ADDR, LOW_VOLTAGE_V)
 
-    try:
-        ina = INA219()
-    except Exception as exc:
-        logging.critical("Cannot initialise INA219: %s", exc)
-        sys.exit(1)
+    ina = _probe_absent()
 
     low_count       = 0   # consecutive low-voltage readings
     warned          = False
