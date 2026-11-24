@@ -1,0 +1,40 @@
+# logrotate for the UPS HAT logs -- install as /etc/logrotate.d/ups_hat (root:root 0644):
+#   sudo install -m 0644 -o root -g root ups_hat.logrotate /etc/logrotate.d/ups_hat
+# Run daily by logrotate.timer; a log rotates once it passes 25 MB.
+#
+# copytruncate: both writers (ups-shutdown.service, the desktop tray) hold the
+# file open through logging.FileHandler in append mode, and ups-shutdown must not
+# be restarted just to reopen a log. Lines written between the copy and the
+# truncate (a second's worth at most) are lost.
+# The directory is group-writable, so each stanza names the user logrotate runs as.
+# Archives go to logs/ (gitignored), dated, 12 kept. The history up to the first
+# rotation is logs/*.until-20261124.gz, named outside this pattern so it is
+# never aged out: it is the raw data behind the README's battery analysis.
+
+/home/ugur/source/ups_hat/battery.log {
+    su ugur ugur
+    size 25M
+    rotate 12
+    olddir logs
+    createolddir 0755 ugur ugur
+    dateext
+    dateformat -%Y%m%d-%s
+    compress
+    copytruncate
+    missingok
+    notifempty
+}
+
+/home/ugur/source/ups_hat/ups_shutdown.log {
+    su root root
+    size 25M
+    rotate 12
+    olddir logs
+    createolddir 0755 ugur ugur
+    dateext
+    dateformat -%Y%m%d-%s
+    compress
+    copytruncate
+    missingok
+    notifempty
+}

@@ -186,6 +186,21 @@ missing or stale. Do not trust it: plugging in the charger lifts the terminal vo
 - Shutdown service:  `~/ups_hat/ups_shutdown.log`  
   and `sudo journalctl -u ups-shutdown -f`
 
+**Rotated since 2026-11-24** by [`ups_hat.logrotate`](ups_hat.logrotate). Install it with:
+
+```bash
+sudo install -m 0644 -o root -g root ups_hat.logrotate /etc/logrotate.d/ups_hat
+```
+
+`logrotate.timer` runs daily, and a log rotates once it passes 25 MB, using `copytruncate`.
+The writers keep the file open in append mode, so they need no restart. Archives go to
+`logs/` (gitignored) as dated `.gz` files, and the last 12 are kept. Before rotation the logs
+had reached 95 MB (tray) and 184 MB (service), at one line every 2 s since April. The history
+up to the first rotation is kept for good, as `logs/*.log.until-20261124.gz` (8 + 16 MB,
+2026-04-04 → 2026-11-24). Those names fall outside the rotation pattern, so they never age
+out: they hold the raw data behind the battery analysis below. Read them with
+`zcat`/`zgrep`.
+
 ## Battery percentage: load-compensated, not raw voltage (fixed 2026-09-01)
 
 **Symptom:** unplug the mains and the percentage falls; plug it back and it rises.
