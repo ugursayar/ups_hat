@@ -281,7 +281,7 @@ hysteresis on a 5-sample average: on above 80 mA, off below 20 mA.
 |---|---|
 | `v_oc < 6.2 V` and not charging | **immediate `poweroff`** |
 | `v_oc < 6.4 V` and not charging, 5 reads (10 s) | warn, then **60 s countdown**; cancelled if voltage recovers or charging starts |
-| **`v` (raw) < 5.6 V** | **immediate `poweroff`, compensation bypassed** |
+| **`v` (raw) < 6.10 V** *(5.6 V until 2026-11-06)* | **immediate `poweroff`, compensation bypassed** |
 
 **`6.4` and `6.2` were always meant as resting per-cell figures** — 3.20 and 3.10 V/cell.
 Applied to a terminal reading taken while the pack delivers an amp they fired early:
@@ -565,6 +565,30 @@ the service with the new cells, and far earlier on the worn pack (4× the sag). 
 headless with `poweroff` stubbed: 8/8 cases — service fine at raw 6.30 V → nothing; service
 warns → its countdown shown, tray ticks never power off; service cancels → dismissed;
 service stale → fallback countdown and poweroff; service returns → fallback stopped.
+
+**The tray shows `ups-watchdog` and leaves the bus alone (2026-11-24).** On mediapi,
+`ups-watchdog` (source `~/source/system/devices/mediapi/appliance/ups-watchdog`) watches
+`status.json` and nothing else. When this service stops rewriting it, as happens when the I²C
+bus wedges, the watchdog writes `/run/ups-watchdog/state.json` with `"blind": true` and
+`poweroff_in`, and after 30 min blind runs a clean `systemctl poweroff`. The tray reads that
+file on its **own GUI-thread timer (2 s)**, not in the I²C worker. A wedged bus can make the
+worker raise, or hang in a read forever, and this warning exists for exactly that case. While
+`blind` is true and the file is under 60 s old, it shows a sticky non-modal box ("UPS monitor
+not reporting — the battery is unguarded — clean shutdown in N min"), a one-time tray
+notification, a grey icon with a red outline and a red `!`, and the same line at the top of the
+tooltip. All of these clear when the state is no longer blind or the file goes stale. The
+tray's own shutdown logic and thresholds are unchanged. The I²C worker also **no longer polls
+the INA219 while `status.json` is fresh**: the file carries `v`, `current_ma`, `power_w` and
+`pct`, so the tray takes those and leaves the bus to this service. Before this change the tray
+was a second I²C master, rewriting the calibration register every 2 s. It opens the INA219 only
+once the file goes stale, when its own fallback has to guard the pack. As before, a failed open
+is not retried. Tested headless with `smbus.SMBus` stubbed to fail on any open and `os.system`
+stubbed to fail on any call: 53/53. These covered the pure `watchdog_alert()` against fake
+state files (fresh/stale/future `ts`, `poweroff_in` 1800 / 90 / 20 / 0 / null, malformed
+files); `Worker.sample()` never opening the INA219 while the status is fresh, and opening it
+once when stale; and the tray's box, tint, tooltip, countdown update and clear, including one
+real timer tick. Live after the restart, the tray holds no `/dev/i2c-1` descriptor; the old
+process held one.
 
 **A third charge state: on AC (2026-11-06).** The service's `state` is only `CHG` / `DIS`, and
 `DIS` means *not charging* — the tray printed it as "Discharging" while the pack sat on mains

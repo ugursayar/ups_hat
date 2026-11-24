@@ -82,6 +82,46 @@ def read_service_status():
     return None
 
 
+# ups-watchdog (mediapi appliance, 2026-11-24) watches STATUS_FILE and nothing
+# else -- it never touches I2C. When ups_shutdown.py stops rewriting it (a wedged
+# I2C bus: the low-battery protection is blind) it says so here, and after
+# 30 min blind it runs a clean `systemctl poweroff`. Written every 5 s:
+# {"ts", "blind": bool, "blind_for": s, "poweroff_in": s|null, "reason", ...}
+WATCHDOG_FILE      = "/run/ups-watchdog/state.json"
+WATCHDOG_MAX_AGE_S = 60     # an older file says nothing (the watchdog is not running)
+
+
+def read_watchdog_state(path=None):
+    """The watchdog's state.json as a dict, or None. Plain file read, no I2C."""
+    try:
+        with open(path or WATCHDOG_FILE) as fh:
+            st = json.load(fh)
+        return st if isinstance(st, dict) else None
+    except Exception:
+        return None
+
+
+def watchdog_alert(state, now: float):
+    """The warning to show, or None. Pure: a function of the state and the clock.
+
+    Warns only when the watchdog says blind AND its file is under
+    WATCHDOG_MAX_AGE_S old -- a stale file is a stopped watchdog, not news."""
+    if not isinstance(state, dict) or state.get("blind") is not True:
+        return None
+    try:
+        if abs(now - float(state["ts"])) >= WATCHDOG_MAX_AGE_S:
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    left = state.get("poweroff_in")
+    if isinstance(left, (int, float)) and not isinstance(left, bool):
+        when = "now" if left <= 0 else f"in {max(1, round(left / 60))} min"
+    else:
+        when = "pending"
+    return ("UPS monitor not reporting — the battery is unguarded — "
+            f"clean shutdown {when}")
+
+
 # ── INA219 driver ─────────────────────────────────────────────────────────────
 class INA219:
     """Minimal INA219 driver, calibrated for the UPS HAT (0.01 Ω shunt, 5 A range)."""
@@ -145,8 +185,11 @@ class INA219:
 
 
 # ── Battery icon generator (no image files needed) ───────────────────────────
-def _make_battery_pixmap(percent: float, charging: bool, size: int = 22) -> QPixmap:
-    """Draw a colour-coded battery icon with Qt. No external image files needed."""
+def _make_battery_pixmap(percent: float, charging: bool, size: int = 22,
+                         alert: bool = False) -> QPixmap:
+    """Draw a colour-coded battery icon with Qt. No external image files needed.
+
+    alert: the UPS monitor is blind -- grey fill, red outline, a red '!'."""
     img = QImage(size, size, QImage.Format_RGBA8888)
     img.fill(Qt.transparent)
 
@@ -154,7 +197,9 @@ def _make_battery_pixmap(percent: float, charging: bool, size: int = 22) -> QPix
     p.setRenderHint(QPainter.Antialiasing)
 
     # Choose fill colour based on charge level or charging state
-    if charging:
+    if alert:
+        fill_col = QColor("#9E9E9E")   # grey  – the reading is not trustworthy
+    elif charging:
         fill_col = QColor("#2196F3")   # blue  – charging
     elif percent > 50:
         fill_col = QColor("#4CAF50")   # green
@@ -163,7 +208,7 @@ def _make_battery_pixmap(percent: float, charging: bool, size: int = 22) -> QPix
     else:
         fill_col = QColor("#F44336")   # red   – critical
 
-    outline_col = QColor("#CCCCCC")
+    outline_col = QColor("#F44336") if alert else QColor("#CCCCCC")
 
     # Body dimensions
     bw = int(size * 0.72)
@@ -193,54 +238,79 @@ def _make_battery_pixmap(percent: float, charging: bool, size: int = 22) -> QPix
     if fw > 0:
         p.drawRoundedRect(bx + margin, by + margin, fw, bh - 2 * margin, 1, 1)
 
-    # Charging bolt overlay
-    if charging:
+    # Overlay: '!' when the monitor is blind, else the charging bolt
+    if alert or charging:
         font = QFont()
         font.setPixelSize(max(8, int(size * 0.52)))
+        font.setBold(alert)
         p.setFont(font)
-        p.setPen(QColor(255, 255, 255, 210))
-        p.drawText(bx, by, bw, bh, Qt.AlignCenter, "⚡")
+        p.setPen(QColor("#D50000") if alert else QColor(255, 255, 255, 210))
+        p.drawText(bx, by, bw, bh, Qt.AlignCenter, "!" if alert else "⚡")
 
     p.end()
     return QPixmap.fromImage(img)
 
 
-def make_battery_icon(percent: float, charging: bool, size: int = 22) -> QIcon:
-    return QIcon(_make_battery_pixmap(percent, charging, size))
+def make_battery_icon(percent: float, charging: bool, size: int = 22,
+                      alert: bool = False) -> QIcon:
+    return QIcon(_make_battery_pixmap(percent, charging, size, alert))
 
 
 # ── Background worker thread ──────────────────────────────────────────────────
 class Worker(QObject):
-    """Polls the INA219 in a background thread and emits readings."""
+    """Emits readings every POLL_INTERVAL_S from a background thread.
+
+    While ups_shutdown.py's status file is fresh it carries everything the tray
+    shows (v, current_ma, power_w, pct, state), so the tray leaves the I2C bus
+    alone -- before 2026-11-24 it was a second master on it, rewriting the
+    INA219's calibration every 2 s (devices/mediapi/CLAUDE.md, "I2C bus --
+    handle with care"). The INA219 is opened and read only while that file is
+    stale, i.e. the service is down and the tray's own fallback must guard."""
 
     # voltage_v, current_a, power_w, percent (0–100), charging,
     # service status (dict) or None when ups_shutdown.py's file is stale
     updated = pyqtSignal(float, float, float, float, bool, object)
 
-    def run(self):
-        try:
-            ina = INA219()
-        except Exception as e:
-            logging.error(f"Failed to initialise INA219: {e}")
-            return
+    _SERVICE_KEYS = ("v", "current_ma", "power_w", "pct")
 
+    def __init__(self):
+        super().__init__()
+        self._ina = None
+        self._ina_failed = False   # as before: one failed init, no more bus traffic
+
+    def sample(self):
+        """One reading as (v, current_a, power_w, pct, chg, st), or None."""
+        st = read_service_status()
+        if st is not None and all(k in st for k in self._SERVICE_KEYS):
+            # The service's percentage: load-compensated and coulomb-counted.
+            # Raw terminal volts jump ~60 points the moment the charger lifts
+            # the bus, with no charge moved.
+            return (float(st["v"]), float(st["current_ma"]) / 1000.0,
+                    float(st["power_w"]), float(st["pct"]),
+                    st.get("state") == "CHG", st)
+        # Fallback: the service is not reporting -- read the INA219 ourselves.
+        if self._ina is None:
+            if self._ina_failed:
+                return None
+            try:
+                self._ina = INA219()
+            except Exception as e:
+                self._ina_failed = True
+                logging.error(f"Failed to initialise INA219: {e}")
+                return None
+        v   = self._ina.get_bus_voltage_v()
+        c   = self._ina.get_current_ma()    # mA
+        pw  = self._ina.get_power_w()
+        pct = (v - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V) * 100.0
+        pct = max(0.0, min(100.0, pct))
+        return (v, c / 1000.0, pw, pct, c > CHARGING_THRESHOLD_MA, None)
+
+    def run(self):
         while True:
             try:
-                v   = ina.get_bus_voltage_v()
-                c   = ina.get_current_ma()    # mA
-                pw  = ina.get_power_w()
-                st  = read_service_status()
-                if st is not None:
-                    # The service's percentage: load-compensated and coulomb-
-                    # counted. Raw terminal volts jump ~60 points the moment the
-                    # charger lifts the bus, with no charge moved.
-                    pct = float(st["pct"])
-                    chg = st.get("state") == "CHG"
-                else:
-                    pct = (v - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V) * 100.0
-                    pct = max(0.0, min(100.0, pct))
-                    chg = c > CHARGING_THRESHOLD_MA
-                self.updated.emit(v, c / 1000.0, pw, pct, chg, st)
+                r = self.sample()
+                if r is not None:
+                    self.updated.emit(*r)
             except Exception as e:
                 logging.error(f"INA219 read error: {e}")
             time.sleep(POLL_INTERVAL_S)
@@ -266,6 +336,9 @@ class BatteryTray(QMessageBox):
         self._msgBox    = None
         self._counter   = 0
         self._following = False   # True while the service's status is fresh
+        self._tooltip   = "UPS Monitor starting…"
+        self._wd_alert  = None    # ups-watchdog's warning text while blind, else None
+        self._wdBox     = None
 
         # ── Tray icon ──
         self.tray = QSystemTrayIcon(self)
@@ -294,6 +367,57 @@ class BatteryTray(QMessageBox):
 
         # ── Countdown timer (1-second ticks) ──
         self._timer = QTimer(self, timeout=self._on_tick)
+
+        # ── ups-watchdog check: on the GUI thread, on its own timer ──
+        # Not in the worker: a wedged bus can raise there, or hang the worker in
+        # an I2C read for good, and this warning is for exactly that case.
+        self._wd_timer = QTimer(self, timeout=self._check_watchdog)
+        self._wd_timer.start(POLL_INTERVAL_S * 1000)
+        self._check_watchdog()
+
+    # ── ups-watchdog warning (a file read only; never I2C) ────────────────────
+    def _check_watchdog(self):
+        try:
+            alert = watchdog_alert(read_watchdog_state(), time.time())
+        except Exception as e:               # never let this stop the timer
+            logging.error(f"ups-watchdog state: {e}")
+            return
+        if alert == self._wd_alert:
+            return
+        was, self._wd_alert = self._wd_alert, alert
+        if alert:
+            if was is None:
+                logging.warning("ups-watchdog: %s", alert)
+                self.tray.showMessage("⚠  UPS monitor not reporting", alert,
+                                      QSystemTrayIcon.Critical, 30000)
+            if self._wdBox is None:
+                self._wdBox = QMessageBox(
+                    QMessageBox.Critical, "⚠  UPS Monitor Not Reporting", "")
+                self._wdBox.setStandardButtons(QMessageBox.NoButton)  # sticky
+                self._wdBox.setInformativeText(
+                    "Check <tt>systemctl status ups-shutdown</tt>. A wedged I²C "
+                    "bus needs a full power cycle (UPS HAT switch off).")
+            self._wdBox.setText(f"<b>{alert}</b>")
+            self._wdBox.show()                # non-modal: the watchdog does the poweroff
+        else:
+            logging.info("ups-watchdog: no longer reports blind (or its file is stale) "
+                         "— warning cleared.")
+            if self._wdBox is not None:
+                self._wdBox.hide()
+                self._wdBox.close()
+                self._wdBox = None
+        self._apply_icon()
+
+    def _apply_icon(self):
+        """Icon + tooltip from the last reading, tinted while the monitor is blind."""
+        icon = make_battery_icon(int(self._percent), self._charging,
+                                 alert=self._wd_alert is not None)
+        self.tray.setIcon(icon)
+        self.setIconPixmap(icon.pixmap(48, 48))
+        tip = self._tooltip
+        if self._wd_alert:
+            tip = f"⚠ {self._wd_alert}\n{tip}"
+        self.tray.setToolTip(tip)
 
     # ── Countdown tick ────────────────────────────────────────────────────────
     def _on_tick(self):
@@ -356,10 +480,6 @@ class BatteryTray(QMessageBox):
         self._percent  = percent
         self._voltage  = voltage
 
-        icon = make_battery_icon(int(percent), charging)
-        self.tray.setIcon(icon)
-        self.setIconPixmap(icon.pixmap(48, 48))
-
         if svc is not None:
             # The service's three-way state; "not charging" is not "discharging".
             state = {"charging": "Charging ⚡", "discharging": "Discharging",
@@ -370,7 +490,8 @@ class BatteryTray(QMessageBox):
         tooltip = f"{percent:.0f}%  {voltage:.3f} V  {current_a:+.3f} A  [{state}]"
         if svc is None:
             tooltip += "  (own reading — UPS service not running)"
-        self.tray.setToolTip(tooltip)
+        self._tooltip = tooltip
+        self._apply_icon()
         logging.info(tooltip)
 
         self.setText(
